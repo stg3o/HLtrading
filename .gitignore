@@ -1,0 +1,14 @@
+venv/
+.env
+
+# Runtime state — contains live positions and trade history, don't commit
+paper_state.json
+paper_trades.csv
+trade_history.csv
+signals.log
+best_configs.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo

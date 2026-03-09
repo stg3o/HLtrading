@@ -1,0 +1,9 @@
+ccxt
+colorama
+python-dotenv
+eth-account
+hyperliquid-python-sdk
+matplotlib
+pandas
+pandas_ta
+yfinance

@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS launchd plist — auto-start trading bot on login (dev user account).
+
+  SETUP (run these commands once as devuser):
+
+  1. Edit the paths below to match your actual install location.
+     Replace /Users/devuser/... with your actual paths.
+
+  2. Copy to LaunchAgents:
+       cp com.arbitrage.tradingbot.plist ~/Library/LaunchAgents/
+
+  3. Load it (starts now + on every future login):
+       launchctl load ~/Library/LaunchAgents/com.arbitrage.tradingbot.plist
+
+  4. To check status:
+       launchctl list | grep arbitrage
+
+  5. To stop / unload:
+       launchctl unload ~/Library/LaunchAgents/com.arbitrage.tradingbot.plist
+
+  6. To start manually without waiting for login:
+       launchctl start com.arbitrage.tradingbot
+
+  NOTE: The bot runs non-interactively (no terminal input).
+  Menu option [1] Start Bot is called automatically via -autostart flag.
+  Make sure Ollama is also set to auto-start:
+       brew services start ollama
+-->
+<plist version="1.0">
+<dict>
+
+  <!-- Unique label — must match filename -->
+  <key>Label</key>
+  <string>com.arbitrage.tradingbot</string>
+
+  <!-- Command to run: Python interpreter inside your venv -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/devuser/Projects/arbitrage-main/.venv/bin/python</string>
+    <string>/Users/devuser/Projects/arbitrage-main/main.py</string>
+    <string>--autostart</string>
+  </array>
+
+  <!-- Working directory — must contain .env and all project files -->
+  <key>WorkingDirectory</key>
+  <string>/Users/devuser/Projects/arbitrage-main</string>
+
+  <!-- Log stdout and stderr to files for debugging -->
+  <key>StandardOutPath</key>
+  <string>/Users/devuser/Projects/arbitrage-main/bot.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/devuser/Projects/arbitrage-main/bot_error.log</string>
+
+  <!-- Start on login -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart automatically if the process crashes -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Wait 30s before restarting after a crash (avoid tight restart loops) -->
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+
+  <!-- Environment variables — dotenv handles secrets, but PATH needs to be set -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/devuser</string>
+  </dict>
+
+</dict>
+</plist>

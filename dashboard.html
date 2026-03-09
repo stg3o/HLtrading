@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Keltner Bot Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg:#0d1117; --surface:#161b22; --border:#30363d;
+    --green:#3fb950; --red:#f85149; --yellow:#d29922;
+    --cyan:#58a6ff; --text:#c9d1d9; --muted:#8b949e;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;padding:24px}
+  h1{color:var(--cyan);font-size:1.4rem;margin-bottom:4px}
+  .sub{color:var(--muted);font-size:.85rem;margin-bottom:24px}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:12px;margin-bottom:26px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px}
+  .card .lbl{color:var(--muted);font-size:.7rem;text-transform:uppercase;letter-spacing:.05em}
+  .card .val{font-size:1.4rem;font-weight:600;margin-top:4px}
+  .green{color:var(--green)} .red{color:var(--red)} .yellow{color:var(--yellow)} .cyan{color:var(--cyan)}
+  .charts{display:grid;grid-template-columns:2fr 1fr;gap:12px;margin-bottom:26px}
+  .cbox{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px}
+  .cbox h2{font-size:.72rem;color:var(--muted);margin-bottom:10px;text-transform:uppercase;letter-spacing:.05em}
+  canvas{max-height:220px}
+  section{margin-bottom:26px}
+  section h2{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
+  table{width:100%;border-collapse:collapse;font-size:.79rem}
+  th{background:var(--surface);color:var(--muted);text-align:left;padding:7px 11px;border-bottom:1px solid var(--border);font-weight:500}
+  td{padding:6px 11px;border-bottom:1px solid #21262d}
+  tr:hover td{background:#1c2128}
+  .badge{display:inline-block;padding:2px 7px;border-radius:4px;font-size:.68rem;font-weight:600}
+  .bl{background:#1f3d2e;color:var(--green)} .bs{background:#3d1f1f;color:var(--red)}
+  .empty{color:var(--muted);font-style:italic;padding:12px 0}
+  footer{color:var(--muted);font-size:.7rem;margin-top:14px;text-align:right}
+  @media(max-width:720px){.charts{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<h1>&#x1F916; Keltner Bot Dashboard</h1>
+<p class="sub">Generated 2026-03-09 03:58 &middot; Paper Trading</p>
+
+<div class="cards">
+  <div class="card"><div class="lbl">Capital</div><div class="val cyan">$672.00</div></div>
+  <div class="card"><div class="lbl">Total P&amp;L</div><div class="val green">$+0.00</div></div>
+  <div class="card"><div class="lbl">Return</div><div class="val green">+0.00%</div></div>
+  <div class="card"><div class="lbl">Win Rate</div><div class="val red">0.0%</div></div>
+  <div class="card"><div class="lbl">Trades</div><div class="val">0</div></div>
+  <div class="card"><div class="lbl">Max Drawdown</div><div class="val green">0.0%</div></div>
+  <div class="card"><div class="lbl">Status</div><div class="val green">ACTIVE</div></div>
+</div>
+
+<div class="charts">
+  <div class="cbox"><h2>Equity Curve</h2><canvas id="ec"></canvas></div>
+  <div class="cbox"><h2>P&amp;L by Coin</h2><canvas id="cc"></canvas></div>
+</div>
+
+<section>
+  <h2>Open Positions</h2>
+  <table><thead><tr><th>Coin</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th><th>Size</th><th>Opened</th></tr></thead><tbody><tr><td>SOL</td><td><span class="badge bs">SHORT</span></td><td>$82.8745</td><td>$83.0402</td><td>$82.3451</td><td>119.495839 u</td><td>2026-03-09 03:54</td></tr></tbody></table>
+</section>
+
+<section>
+  <h2>Trade History &mdash; last 0 of 0</h2>
+  <p class="empty">No closed trades yet.</p>
+</section>
+
+<footer>dashboard.py &middot; 2026-03-09 03:58</footer>
+
+<script>
+const eq = {"labels": [], "values": []};
+const co = {"labels": [], "values": []};
+if(eq.labels.length){
+  new Chart(document.getElementById('ec'),{type:'line',data:{labels:eq.labels,datasets:[{label:'Capital ($)',data:eq.values,borderColor:'#58a6ff',backgroundColor:'rgba(88,166,255,0.08)',fill:true,tension:.3,pointRadius:eq.values.length>60?0:3,borderWidth:2}]},options:{responsive:true,maintainAspectRatio:true,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#8b949e',maxTicksLimit:8},grid:{color:'#21262d'}},y:{ticks:{color:'#8b949e',callback:v=>'$'+v.toLocaleString()},grid:{color:'#21262d'}}}}})};
+if(co.labels.length){
+  new Chart(document.getElementById('cc'),{type:'bar',data:{labels:co.labels,datasets:[{label:'P&L ($)',data:co.values,backgroundColor:co.values.map(v=>v>=0?'#3fb950':'#f85149'),borderRadius:4}]},options:{responsive:true,maintainAspectRatio:true,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#8b949e'},grid:{color:'#21262d'}},y:{ticks:{color:'#8b949e',callback:v=>'$'+v},grid:{color:'#21262d'}}}}})};
+</script>
+</body>
+</html>
