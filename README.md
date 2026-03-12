@@ -27,7 +27,7 @@ A sophisticated futures trading bot designed for crypto markets with advanced te
 1. **Clone the repository:**
    ```bash
    git clone <repository-url>
-   cd arbitrage-main
+   cd HLTRADING-main
    ```
 
 2. **Install dependencies:**
@@ -52,8 +52,11 @@ A sophisticated futures trading bot designed for crypto markets with advanced te
 
 4. **Run the bot:**
    ```bash
-   # Start the futures scalper
-   python3 futures_scalper_improved.py
+   # Start the trading bot CLI
+   python3 main.py
+
+   # Or explicitly use the project virtualenv
+   ./.venv/bin/python main.py
 
    # Run paper trading
    python3 paper_trader.py
@@ -122,10 +125,9 @@ AI_CONFIDENCE_THRESHOLD = 0.60                  # Minimum confidence to trade
 ├── paper_trader.py        # Paper trading simulation
 ├── backtester.py          # Historical backtesting
 ├── dashboard.py           # Web dashboard
-├── futures_scalper.py     # Original arbitrage detection
-├── futures_scalper_improved.py  # Enhanced version with logging
+├── main.py                # Main trading bot CLI / runtime entrypoint
 ├── validate_csv_headers.py # CSV header validation
-├── test_*.py              # Unit tests
+├── tests/                 # Unit, regression, integration, and manual tests
 └── requirements.txt       # Python dependencies
 ```
 
@@ -133,8 +135,8 @@ AI_CONFIDENCE_THRESHOLD = 0.60                  # Minimum confidence to trade
 
 ### Basic Trading
 ```bash
-# Start live trading (testnet)
-python3 trader.py
+# Start the bot CLI
+python3 main.py
 
 # Start paper trading
 python3 paper_trader.py
@@ -154,14 +156,14 @@ python3 backtester.py --strategy supertrend --pair ETH --interval 1h
 
 ### Configuration Override
 ```bash
-# Override configuration via command line
-python3 trader.py --testnet --paper-capital 1000 --max-positions 3
+# Start non-interactive bot mode
+python3 main.py --autostart
 ```
 
 ## Monitoring and Logging
 
 ### Log Files
-- `arbitrage.log` - Futures scalper logs
+- `arbitrage.log` - Bot/runtime logs
 - `paper_trades.csv` - Paper trading history
 - `opportunities.csv` - Arbitrage opportunities
 - `signals.log` - Trade signals
@@ -235,9 +237,9 @@ python3 tests/manual/test_enhanced_backtester.py
 ### Common Issues
 
 **"No arbitrage opportunities found"**
-- Normal in efficient markets
-- Check fee thresholds and spread requirements
-- Verify exchange connectivity
+- Check strategy/risk filters and market regime gates
+- Verify exchange connectivity and data downloads
+- Confirm enabled coins/configuration are correct
 
 **"ImportError: No module named 'ccxt'"**
 - Run `pip install -r requirements.txt`
@@ -257,7 +259,7 @@ python3 tests/manual/test_enhanced_backtester.py
 Enable debug logging by setting environment variable:
 ```bash
 export DEBUG=1
-python3 trader.py
+python3 main.py
 ```
 
 ## Performance Optimization
