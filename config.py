@@ -29,7 +29,7 @@ COINS = {
     # All top-5 converged on st_mult=2.5 and sl=0.8% — strong consensus.
     # Main exit is the ST flip (trend reversal); SL is safety-net only.
     "ETH": {"ticker": "ETH-USD", "interval": "1h", "period": "365d",
-            "hl_symbol": "ETH", "hl_size": 0.01,  "enabled": True,
+            "hl_symbol": "ETH", "hl_size": 0.01,  "sz_decimals": 4,  "enabled": True,
             "strategy_type": "supertrend",
             "st_period": 10, "st_multiplier": 2.5,
             "stop_loss_pct": 0.008,
@@ -55,35 +55,182 @@ COINS = {
     #   sl: 0.004 → 0.002  (optimizer confirmed 0.2% is best-scoring SL)
     #   tp: 0.008 → 0.004  (maintains 2:1 R:R with tighter SL)
     #   rsi: 40/60 → 35/65  (looser bands = more signals)
-    #   ma_trend_filter: True → False  (removing the biggest signal killer)
+    #   ma_trend_filter: False → re-enabled (Mar-2026 trending day caused 16-loss streak without it)
     # Re-run optimizer (option 12) on SOL alone to validate — target: 50+ trades.
-    # SOL — walk-forward ROBUST: val pf=1.30 > train pf=1.26 (424 trades, Feb-Mar 2026).
-    # Strategy is performing BETTER in the current market regime than the training period.
-    # Optimizer and walk-forward both confirm sl=0.2% / rsi=35/65 / MA_filter=OFF.
-    # sl reverted 0.3% → 0.2%: the 0.3% made the live R:R gate STRICTER (needed 0.36%
-    # midline distance), not looser. 0.2% requires only 0.24% — more signals pass.
+    # SOL — KC mean-reversion scalping on 5m.
+    # Optimizer (fixed-capital, Mar-2026): rank-1 = kc=1.0, rsi=40/60, PF=1.31, 1973 trades.
+    # rsi updated 35/65 → 40/60: same PF (1.31 vs 1.30) but 635 more trades (1973 vs 1338).
+    # sl=0.2% retained: wider SL kills Gate 3 (R:R check).
     "SOL": {"ticker": "SOL-USD", "interval": "5m", "period": "60d",
-            "hl_symbol": "SOL", "hl_size": 0.2,   "enabled": True,  # min floor; 0.2 SOL ≈ $16
+            "hl_symbol": "SOL", "hl_size": 0.2,   "sz_decimals": 2,  "enabled": True,  # min floor; 0.2 SOL ≈ $16
             "strategy_type": "mean_reversion",
-            "ma_trend_filter": False,
-            "rsi_oversold": 35, "rsi_overbought": 65,
-            "stop_loss_pct": 0.002, "take_profit_pct": 0.004,  # 0.2% SL / 0.4% TP — optimizer best; wider SL kills Gate 3
+            "ma_trend_filter": True,   # re-enabled: prevents counter-trend fades in trending markets
+            "rsi_oversold": 40, "rsi_overbought": 60,
+            "stop_loss_pct": 0.002, "take_profit_pct": 0.004,
             "max_bars_in_trade": 36},   # 3 h max hold on 5m bars
 
     # DOGE — KC mean-reversion scalping on 5m.
     # Rationale: retail-driven, high-volume, low correlation to SOL/ETH ecosystem.
-    # Optimizer rank-1 (60d): pf=1.29, wr=43%, 1924 trades — stronger than SOL.
+    # Optimizer rank-1 (7d): pf=1.29, wr=43%, 1924 trades — stronger than SOL.
     # Key difference vs SOL: kc_scalar=2.0 (wider bands needed for DOGE's volatility),
     # rsi=45/55 (tighter RSI — more signals pass vs SOL's 35/65).
     # kc_scalar is now per-coin — does NOT affect SOL's kc=1.0.
-    "DOGE": {"ticker": "DOGE-USD", "interval": "5m", "period": "60d",
-             "hl_symbol": "DOGE", "hl_size": 500,  "enabled": True,  # 500 DOGE ≈ $85 at $0.17
+    # Note: yfinance only provides 5m data for DOGE up to 7 days, not 30 days.
+    "DOGE": {"ticker": "DOGE-USD", "interval": "5m", "period": "7d",
+             "hl_symbol": "DOGE", "hl_size": 500,  "enabled": True,
+             "sz_decimals": 0,          # HL DOGE requires whole-number lot sizes (no fractions)
              "strategy_type": "mean_reversion",
              "kc_scalar": 2.0,          # optimizer rank-1: wider bands suit DOGE volatility
-             "ma_trend_filter": False,
+             "ma_trend_filter": True,   # re-enabled: prevents counter-trend fades in trending markets
              "rsi_oversold": 45, "rsi_overbought": 55,   # optimizer rank-1
              "stop_loss_pct": 0.002, "take_profit_pct": 0.004,  # 0.2% SL / 0.4% TP — same as SOL
              "max_bars_in_trade": 36},
+
+    # ─── CANDIDATE COINS — disabled pending optimizer validation ──────────────────
+    # All confirmed to have 60d of 5m yfinance data (1280+ bars, Feb–Mar 2026).
+    # Default params below are conservative starting points.  The optimizer will
+    # search kc_scalar ∈ {1.0, 1.25, 1.5, 2.0} and rsi_oversold ∈ {35, 40, 45}.
+    # Enable a coin ONLY after the optimizer shows PF ≥ 1.2 on its best config.
+    # sz_decimals values come from HL asset metadata — verify each before live trading.
+
+    # XRP — high liquidity, retail-driven, strong mean-reversion history on 5m.
+    # Optimizer rank-1 (60d): pf=1.23, wr=39%, 1326 trades — MARGINAL (barely clears 1.2 threshold).
+    # ⚠ PROBATIONARY: live PF must stay ≥ 1.1 over first 30 trades; disable if it drifts below.
+    # After spread/slippage, real-world edge is likely ~PF 1.05–1.10. Watch closely.
+    "XRP":  {"ticker": "XRP-USD",  "interval": "5m", "period": "60d",
+             "hl_symbol": "XRP",  "hl_size": 5,    "sz_decimals": 1,  "enabled": True,
+             "strategy_type": "mean_reversion",
+             "ma_trend_filter": True,   # re-enabled
+             "rsi_oversold": 35, "rsi_overbought": 65,
+             "stop_loss_pct": 0.002, "take_profit_pct": 0.004,
+             "max_bars_in_trade": 36},
+
+    # WIF — meme-tier volatility. kc_scalar is irrelevant (all values tied at PF=1.45).
+    # Optimizer fixed-capital rank-1 (Mar-2026): rsi=35/65, PF=1.45, 1557 trades.
+    # rsi updated 40/60 → 35/65 (previous run had compounding artifact inflating 40/60).
+    # Note: yfinance only provides 5m data for WIF up to 30 days, not 60 days.
+    "WIF":  {"ticker": "WIF-USD",  "interval": "5m", "period": "30d",
+             "hl_symbol": "WIF",  "hl_size": 7,    "sz_decimals": 0,  "enabled": True,
+             "strategy_type": "mean_reversion",
+             "kc_scalar": 1.5,
+             "ma_trend_filter": True,   # re-enabled
+             "rsi_oversold": 35, "rsi_overbought": 65,
+             "stop_loss_pct": 0.002, "take_profit_pct": 0.004,
+             "max_bars_in_trade": 36},
+
+    # BONK — ultra-low price; HL denominates BONK in 1k-unit lots (1 lot ≈ 1000 BONK).
+    # hl_size=500 → 500 k-lots = 500 000 BONK ≈ $11 at $0.000022/BONK.
+    # Optimizer rank-1 (30d): pf=1.49, wr=36%, 1469 trades — strongest PF of new candidates.
+    # ⚠ VERIFY HL denomination and sz_decimals against HL meta before switching to mainnet.
+    # Note: yfinance only provides 5m data for BONK up to 30 days, not 60 days.
+    "BONK": {"ticker": "BONK-USD", "interval": "5m", "period": "30d",
+             "hl_symbol": "BONK", "hl_size": 500,  "sz_decimals": 0,  "enabled": True,
+             "strategy_type": "mean_reversion",
+             "kc_scalar": 2.0,
+             "ma_trend_filter": True,   # re-enabled
+             "rsi_oversold": 35, "rsi_overbought": 65,
+             "stop_loss_pct": 0.002, "take_profit_pct": 0.004,
+             "max_bars_in_trade": 36},
+
+    # ADA — large-cap alt; optimizer confirmed kc=1.0 (tighter bands suit lower volatility).
+    # Optimizer rank-1 (60d): pf=1.45, wr=38%, 1378 trades.
+    "ADA":  {"ticker": "ADA-USD",  "interval": "5m", "period": "60d",
+             "hl_symbol": "ADA",  "hl_size": 15,   "sz_decimals": 0,  "enabled": True,
+             "strategy_type": "mean_reversion",
+             "ma_trend_filter": True,   # re-enabled
+             "rsi_oversold": 35, "rsi_overbought": 65,
+             "stop_loss_pct": 0.002, "take_profit_pct": 0.004,
+             "max_bars_in_trade": 36},
+
+    # AVAX — mid-cap L1; best Sharpe (13.14) and solid 41% WR among new candidates.
+    # Optimizer rank-1 (60d): pf=1.47, wr=41%, 1390 trades. kc=1.0, rsi=35/65.
+    "AVAX": {"ticker": "AVAX-USD", "interval": "5m", "period": "60d",
+             "hl_symbol": "AVAX", "hl_size": 0.4,  "sz_decimals": 2,  "enabled": True,
+             "strategy_type": "mean_reversion",
+             "ma_trend_filter": True,   # re-enabled
+             "rsi_oversold": 35, "rsi_overbought": 65,
+             "stop_loss_pct": 0.002, "take_profit_pct": 0.004,
+             "max_bars_in_trade": 36},
+
+    # LINK — DeFi oracle token. Optimizer fixed-capital rank-1 (Mar-2026): kc=2.0, rsi=40/60.
+    # kc updated 1.5 → 2.0: same PF=1.32 but 471 more trades (1865 vs 1394).
+    "LINK": {"ticker": "LINK-USD", "interval": "5m", "period": "60d",
+             "hl_symbol": "LINK", "hl_size": 0.8,  "sz_decimals": 2,  "enabled": True,
+             "strategy_type": "mean_reversion",
+             "kc_scalar": 2.0,
+             "ma_trend_filter": True,   # re-enabled
+             "rsi_oversold": 40, "rsi_overbought": 60,
+             "stop_loss_pct": 0.002, "take_profit_pct": 0.004,
+             "max_bars_in_trade": 36},
+
+    # LTC — previously failed at PF=1.17 (compounding artifact). Fixed-capital rerun shows
+    # PF=1.24 with kc=1.0, rsi=35/65 — now clears the 1.2 threshold. Enabled.
+    # ⚠ PROBATIONARY: was previously sub-threshold. Live PF must stay ≥ 1.1 over first 30 trades.
+    "LTC":  {"ticker": "LTC-USD",  "interval": "5m", "period": "60d",
+             "hl_symbol": "LTC",  "hl_size": 0.12, "sz_decimals": 3,  "enabled": True,
+             "strategy_type": "mean_reversion",
+             "ma_trend_filter": True,   # re-enabled
+             "rsi_oversold": 35, "rsi_overbought": 65,
+             "stop_loss_pct": 0.002, "take_profit_pct": 0.004,
+             "max_bars_in_trade": 36},
+
+    # SHIB — ultra-low price meme coin; similar denomination caveat to BONK.
+    # HL may denominate in k-lots; hl_size=1000 → 1M SHIB ≈ $13 at $0.000013.
+    # Optimizer rank-1 (7d): pf=1.33, wr=40%, 1414 trades. kc=1.0, rsi=35/65.
+    # ⚠ VERIFY HL denomination and sz_decimals against HL meta before switching to mainnet.
+    # Note: yfinance only provides 5m data for SHIB up to 7 days, not 60 days.
+    "SHIB": {"ticker": "SHIB-USD", "interval": "5m", "period": "7d",
+             "hl_symbol": "SHIB", "hl_size": 1000, "sz_decimals": 0,  "enabled": True,
+             "strategy_type": "mean_reversion",
+             "ma_trend_filter": True,   # re-enabled
+             "rsi_oversold": 35, "rsi_overbought": 65,
+             "stop_loss_pct": 0.002, "take_profit_pct": 0.004,
+             "max_bars_in_trade": 36},
+
+    # ─── SUPERTREND TREND-FOLLOWING — 1h ──────────────────────────────────────
+    # Complements the KC mean-reversion coins: fires when ADX > 30 (trending
+    # regime) while the 5m KC configs are gated out.  These use the same
+    # hl_symbol as their KC counterparts — the risk manager prevents double-open
+    # (can_open_position checks hl_symbol uniqueness, not just the dict key).
+    #
+    # Params: st(10, 2.5) = ETH consensus params as a starting point.
+    # take_profit_pct=0.05 (5%) is intentionally wide — the ST flip is the
+    # primary exit; TP only fires if the trend runs 5%+ without reversing.
+    # ⚠ Run the optimizer (option 12) on these after 30+ live trades to tune
+    #   st_period, st_multiplier, and stop_loss_pct per coin.
+
+    # SOL_ST — optimizer walk-forward (Mar-2026): ST(14,2.0), sl=0.8%
+    # Train PF=2.52, holdout PF=1.46 (87 trades) — edge confirmed on OOS data.
+    # "OVERFIT" flag fired (42% PF decay train→val) but holdout PF > 1.0 is what counts.
+    "SOL_ST": {"ticker": "SOL-USD", "interval": "1h", "period": "365d",
+               "hl_symbol": "SOL",  "hl_size": 0.2,  "sz_decimals": 2,  "enabled": True,
+               "strategy_type": "supertrend",
+               "st_period": 14, "st_multiplier": 2.0,
+               "stop_loss_pct": 0.008,
+               "take_profit_pct": 0.05,
+               "max_bars_in_trade": 168},   # 7 days max — let the trend run
+
+    # AVAX_ST — optimizer walk-forward (Mar-2026): ST(7,2.5), sl=0.8%
+    # Train PF=2.55, holdout PF=1.73 (93 trades) — strongest OOS result of the three.
+    # Faster ST period (7) suits AVAX's shorter trend cycles vs SOL.
+    "AVAX_ST": {"ticker": "AVAX-USD", "interval": "1h", "period": "365d",
+                "hl_symbol": "AVAX", "hl_size": 0.4,  "sz_decimals": 2,  "enabled": True,
+                "strategy_type": "supertrend",
+                "st_period": 7, "st_multiplier": 2.5,
+                "stop_loss_pct": 0.008,
+                "take_profit_pct": 0.05,
+                "max_bars_in_trade": 168},
+
+    # LINK_ST — DISABLED: holdout PF=0.82 (-0.63 Sharpe, 59 trades) — losing on OOS.
+    # LINK trends too poorly on 1h for SuperTrend to extract edge.
+    # The 5m KC mean-reversion config (LINK) remains active for ranging regimes.
+    "LINK_ST": {"ticker": "LINK-USD", "interval": "1h", "period": "365d",
+                "hl_symbol": "LINK", "hl_size": 0.8,  "sz_decimals": 2,  "enabled": False,
+                "strategy_type": "supertrend",
+                "st_period": 7, "st_multiplier": 3.5,
+                "stop_loss_pct": 0.008,
+                "take_profit_pct": 0.05,
+                "max_bars_in_trade": 168},
 }
 
 # ─── STRATEGY PARAMETERS ──────────────────────────────────────────────────────
@@ -105,12 +252,46 @@ OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 AI_CONFIDENCE_THRESHOLD = 0.60            # minimum confidence to act on AI signal (lowered from 0.65 for more trades)
 AI_LOCAL_FALLBACK_THRESHOLD = 0.50        # if local confidence < this, try cloud
 
+# ─── REGIME DETECTION ─────────────────────────────────────────────────────────
+# Mean-reversion strategies (KC band fade) only work in ranging/choppy markets.
+# In trending regimes, fading the band produces the 14:00–15:30 loss streak pattern.
+#
+# ADX_MR_MAX: skip all mean-reversion signals when ADX exceeds this.
+#   ADX < 20            → ranging / choppy → ideal for KC fade
+#   ADX 20–ADX_MR_MAX   → moderate trend → MA trend filter handles direction
+#   ADX > ADX_MR_MAX    → strong trend → skip mean-reversion entirely
+#   ADX responds in ~14 bars (70 min on 5m) — fast enough to protect intraday.
+#
+# HURST_MR_MAX: secondary regime check. Skip mean-reversion when Hurst > this.
+#   Hurst < 0.45 = mean-reverting  |  Hurst > 0.55 = trending  |  0.45–0.55 = random walk
+#   Threshold 0.55 is looser than previous 0.62 — "random walk or better" blocks trending.
+#   Hurst needs ~200 bars (~16h on 5m) to be reliable; ADX gate fires faster.
+ADX_MR_MAX   = 30     # skip mean-reversion when ADX > 30 (strong trend)
+HURST_MR_MAX = 0.55   # skip mean-reversion when Hurst ≥ 0.55 (trending / random walk)
+
+# ─── GATE / FILTER SWITCHES ───────────────────────────────────────────────────
+# Set to False to bypass a gate without removing its code.
+# Gate 1 (AI edge):          disabled — LLM adds 3-5s latency per coin; optimizer
+#                            already found PF 1.3-1.5 without AI involvement.
+#                            Uses _rule_based_signal() (exact backtest mirror) instead.
+# Gate 2 (entry quality):    disabled — MIN_ENTRY_QUALITY=0.05 is too loose to filter
+#                            anything real; Gate 3 (R:R) already covers the same concern.
+# Hurst gate:                re-enabled at 0.55 threshold (was 0.62 — too loose).
+#                            Works as secondary regime check alongside ADX gate.
+AI_ENABLED               = False   # True = call LLM; False = use rule-based signal directly
+ENTRY_QUALITY_GATE       = False   # True = enforce z-score ≥ MIN_ENTRY_QUALITY
+HURST_GATE               = True    # True = skip mean-reversion when Hurst ≥ HURST_MR_MAX
+
 # ─── RISK MANAGEMENT ──────────────────────────────────────────────────────────
 PAPER_CAPITAL      = 672.0    # starting paper capital (USD) — matches testnet wallet
 RISK_PER_TRADE     = 0.03     # 3% of capital at risk per trade (raised from 2% for more aggression)
 STOP_LOSS_PCT      = 0.004    # 0.4% — optimizer rank-4 SOL recommendation; live-safe width
 TAKE_PROFIT_PCT    = 0.008    # 0.8% fallback TP (2× SL, keeps R:R ratio intact)
-MAX_OPEN_POSITIONS = 3        # maximum concurrent open positions (ETH + SOL + DOGE)
+MAX_OPEN_POSITIONS  = 6       # raised from 3 — supports 9 active 5m coins without constant slot blocking
+MAX_POSITIONS_SIDE  = 3       # max simultaneous longs OR shorts — prevents correlated alt pile-on
+                              # All 9 KC coins are crypto alts: they move together in broad market rallies.
+                              # Capping per-side at 3 limits correlated exposure when the market trends hard.
+                              # At 14:43 on 2026-03-09: AVAX+ADA+SOL+DOGE all shorted simultaneously → -$2.30
 MAX_DAILY_LOSS     = 0.06     # halt trading if down 6% in a day
 MAX_DRAWDOWN       = 0.15     # emergency stop if down 15% from equity peak
 
@@ -125,6 +306,19 @@ MAX_DRAWDOWN       = 0.15     # emergency stop if down 15% from equity peak
 #
 #   Raise to $400-500 if you want even more risk (requires HL leverage headroom).
 HL_MAX_POSITION_USD = 200.0   # max USD notional per HL trade (~30% of account)
+HL_LEVERAGE         = 3       # default cross-margin leverage for all HL trades.
+                              # Set low (3×) — our risk is sized by SL distance, not leverage.
+                              # Liquidation at 3× is ~33% adverse move — far beyond any SL.
+                              # Override per-coin with "hl_leverage": N in COINS config.
+
+# HL_FEE_RATE: Hyperliquid round-trip fee rate (entry + exit combined).
+#   Observed live: $0.09 total per trade on ~$200 notional → 0.045% round-trip.
+#   Applied once per closed trade as: fees = size_usd × HL_FEE_RATE.
+#   The fee is deducted from P&L in close_position() so paper capital tracks
+#   the real wallet balance correctly.
+#   At 33 trades × $0.09 = $2.97 in fees — enough to flip a marginal strategy
+#   from slightly profitable to slightly negative.
+HL_FEE_RATE = 0.00045         # 0.045% round-trip (entry + exit) on notional position size
 
 # ─── EDGE / KELLY FILTERS (from prediction-market sizing theory) ───────────────
 # MIN_EDGE: minimum (ai_confidence − historical_win_rate) required to enter.

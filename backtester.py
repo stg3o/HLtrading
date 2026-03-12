@@ -37,6 +37,8 @@ from config import (
     STOP_LOSS_PCT, TAKE_PROFIT_PCT, RISK_PER_TRADE, PAPER_CAPITAL,
     RSI_OVERSOLD, RSI_OVERBOUGHT, COINS,
 )
+from research.metrics import compute_core_backtest_stats
+from research.simulator import run_mean_reversion_simulation, run_supertrend_simulation
 from strategy import _safe, _hurst, _supertrend_arrays
 
 
@@ -62,124 +64,15 @@ _WARMUP = max(MA_TREND, KC_PERIOD, RSI_PERIOD) + 10
 # ─── SUPERTREND SIMULATION ────────────────────────────────────────────────────
 
 def _run_supertrend_sim(df: pd.DataFrame, p: dict) -> tuple[list, float, list]:
-    """
-    Core Supertrend simulation loop.  Returns (trades, final_capital, equity_curve).
-
-    Entry : confirmed flip bar (direction[i] != direction[i-1]).
-    Exit 1: opposing flip — trend has reversed, take profit.
-    Exit 2: hard stop-loss at entry × (1 ± stop_loss_pct) — safety net only.
-    Exit 3: time stop after max_bars_in_trade bars.
-    """
-    high  = df["High"].to_numpy(dtype=float)
-    low   = df["Low"].to_numpy(dtype=float)
-    close = df["Close"].to_numpy(dtype=float)
-
-    st_period     = int(p.get("st_period",      10))
-    st_multiplier = float(p.get("st_multiplier", 3.0))
-    stop_loss_pct = float(p.get("stop_loss_pct",  0.010))
-    max_bars      = int(p.get("max_bars_in_trade", 168))
-
-    direction, _ = _supertrend_arrays(high, low, close, st_period, st_multiplier)
-
-    warmup       = st_period + 5
-    capital      = float(PAPER_CAPITAL)
-    equity_peak  = capital
-    position     = None
-    trades       = []
-    equity_curve = [capital]
-
-    for i in range(warmup, len(df)):
-        bar_high  = high[i]
-        bar_low   = low[i]
-        bar_close = close[i]
-
-        # ── Manage open position ───────────────────────────────────────────────
-        if position:
-            bars_held = i - position["bar_in"]
-            hit = None
-
-            # Exit 1: opposing flip (main exit — trend reversed)
-            if position["side"] == "long"  and direction[i] == -1 and direction[i-1] == 1:
-                hit = ("st_flip", bar_close)
-            elif position["side"] == "short" and direction[i] ==  1 and direction[i-1] == -1:
-                hit = ("st_flip", bar_close)
-
-            # Exit 2: hard stop-loss (safety net)
-            if hit is None:
-                if position["side"] == "long"  and bar_low  <= position["sl"]:
-                    hit = ("stop_loss", position["sl"])
-                elif position["side"] == "short" and bar_high >= position["sl"]:
-                    hit = ("stop_loss", position["sl"])
-
-            # Exit 3: time stop
-            if hit is None and bars_held >= max_bars:
-                hit = ("time_stop", bar_close)
-
-            if hit:
-                reason, exit_price = hit
-                if position["side"] == "long":
-                    pnl = (exit_price - position["entry"]) * position["size_units"]
-                else:
-                    pnl = (position["entry"] - exit_price) * position["size_units"]
-
-                capital     += pnl
-                equity_peak  = max(equity_peak, capital)
-                trades.append({
-                    "side":    position["side"],
-                    "entry":   position["entry"],
-                    "exit":    round(exit_price, 4),
-                    "pnl":     round(pnl, 4),
-                    "pnl_pct": round(pnl / position["size_usd"] * 100, 3),
-                    "reason":  reason,
-                    "bars":    bars_held,
-                })
-                position = None
-
-            equity_curve.append(capital)
-            continue   # no re-entry on the bar a position closes
-
-        # ── Look for entry: confirmed flip this bar ────────────────────────────
-        if direction[i] == direction[i - 1]:
-            equity_curve.append(capital)
-            continue
-
-        side = "long" if direction[i] == 1 else "short"
-        sl   = (round(bar_close * (1 - stop_loss_pct), 6) if side == "long"
-                else round(bar_close * (1 + stop_loss_pct), 6))
-
-        risk_usd   = capital * RISK_PER_TRADE
-        size_usd   = risk_usd / stop_loss_pct
-        size_units = size_usd / bar_close if bar_close > 0 else 0
-
-        position = {
-            "side":       side,
-            "entry":      bar_close,
-            "size_usd":   size_usd,
-            "size_units": size_units,
-            "sl":         sl,
-            "bar_in":     i,
-        }
-        equity_curve.append(capital)
-
-    # Force-close at end of data
-    if position:
-        last_close = close[-1]
-        if position["side"] == "long":
-            pnl = (last_close - position["entry"]) * position["size_units"]
-        else:
-            pnl = (position["entry"] - last_close) * position["size_units"]
-        capital += pnl
-        trades.append({
-            "side":    position["side"],
-            "entry":   position["entry"],
-            "exit":    round(last_close, 4),
-            "pnl":     round(pnl, 4),
-            "pnl_pct": round(pnl / position["size_usd"] * 100, 3),
-            "reason":  "end_of_data",
-            "bars":    len(df) - 1 - position["bar_in"],
-        })
-
-    return trades, capital, equity_curve
+    """Compatibility wrapper for the shared Supertrend simulation loop."""
+    return run_supertrend_simulation(
+        df,
+        p,
+        paper_capital=PAPER_CAPITAL,
+        risk_per_trade=RISK_PER_TRADE,
+        supertrend_arrays=_supertrend_arrays,
+        include_timestamps=False,
+    )
 
 
 def _run_backtest_st(coin: str, coin_cfg: dict, period: str = "365d",
@@ -243,7 +136,9 @@ def _fetch(ticker: str, interval: str, period: str) -> pd.DataFrame | None:
     try:
         df = yf.download(ticker, interval=interval, period=period,
                          auto_adjust=True, progress=False, timeout=30)
-        if df is None or df.empty:
+        if df is None:
+            return None
+        if df.empty:
             return None
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
         df.dropna(inplace=True)
@@ -329,6 +224,19 @@ def _signal_for_window(df: pd.DataFrame, p: dict) -> tuple[str, str, float, floa
 
 # ─── SIMULATION ───────────────────────────────────────────────────────────────
 
+def _run_mean_reversion_sim(df: pd.DataFrame, p: dict) -> tuple[list, float, list]:
+    """Compatibility wrapper for the shared mean-reversion simulation loop."""
+    return run_mean_reversion_simulation(
+        df,
+        p,
+        paper_capital=PAPER_CAPITAL,
+        risk_per_trade=RISK_PER_TRADE,
+        warmup=_WARMUP,
+        calc_kc_mid=_calc_kc_mid,
+        signal_for_window=_signal_for_window,
+        include_timestamps=False,
+    )
+
 def run_backtest(coin: str, coin_cfg: dict, period: str | None = None,
                  params: dict | None = None, silent: bool = False) -> dict:
     """
@@ -393,131 +301,7 @@ def run_backtest(coin: str, coin_cfg: dict, period: str | None = None,
     if not silent:
         print(f"  {Fore.WHITE}{len(df)} bars ({date_range_days}d).{Style.RESET_ALL}")
 
-    capital       = float(PAPER_CAPITAL)
-    equity_peak   = capital
-    position      = None
-    trades        = []
-    equity_curve  = [capital]
-
-    stop_loss_pct     = p["stop_loss_pct"]
-    take_profit_pct   = p["take_profit_pct"]
-    min_rr            = p["min_rr_ratio"]
-    max_bars_in_trade = p["max_bars_in_trade"]
-
-    for i in range(_WARMUP, len(df)):
-        window    = df.iloc[:i + 1]
-        row       = df.iloc[i]
-        bar_high  = float(row["High"])
-        bar_low   = float(row["Low"])
-        bar_close = float(row["Close"])
-
-        # ── Open position: check SL, dynamic KC midline TP, or time-stop ──────
-        if position:
-            bars_held      = i - position["bar_in"]
-            current_kc_mid = _calc_kc_mid(window)   # dynamic TP target
-            hit            = None
-
-            if position["side"] == "long":
-                if bar_low <= position["sl"]:
-                    hit = ("stop_loss", position["sl"])
-                elif current_kc_mid > 0 and bar_high >= current_kc_mid:
-                    hit = ("tp_midline", min(bar_high, current_kc_mid))
-                elif bar_high >= position["tp_fallback"]:
-                    hit = ("tp_fixed", position["tp_fallback"])
-                elif bars_held >= max_bars_in_trade:
-                    hit = ("time_stop", bar_close)
-            else:  # short
-                if bar_high >= position["sl"]:
-                    hit = ("stop_loss", position["sl"])
-                elif current_kc_mid > 0 and bar_low <= current_kc_mid:
-                    hit = ("tp_midline", max(bar_low, current_kc_mid))
-                elif bar_low <= position["tp_fallback"]:
-                    hit = ("tp_fixed", position["tp_fallback"])
-                elif bars_held >= max_bars_in_trade:
-                    hit = ("time_stop", bar_close)
-
-            if hit:
-                reason, exit_price = hit
-                if position["side"] == "long":
-                    pnl = (exit_price - position["entry"]) * position["size_units"]
-                else:
-                    pnl = (position["entry"] - exit_price) * position["size_units"]
-
-                capital    += pnl
-                equity_peak = max(equity_peak, capital)
-                trades.append({
-                    "side":    position["side"],
-                    "entry":   position["entry"],
-                    "exit":    round(exit_price, 4),
-                    "pnl":     round(pnl, 4),
-                    "pnl_pct": round(pnl / position["size_usd"] * 100, 3),
-                    "reason":  reason,
-                    "bars":    bars_held,
-                })
-                position = None
-
-            equity_curve.append(capital)
-            continue  # no re-entry on the bar a position closes
-
-        # ── No position: look for entry ───────────────────────────────────────
-        action, reason, kc_mid, mat = _signal_for_window(window, p)
-
-        if action in ("long", "short"):
-            sl_dist = bar_close * stop_loss_pct
-
-            if action == "long":
-                tp_mid_dist = max(kc_mid - bar_close, 0)
-                tp_fallback = round(bar_close * (1 + take_profit_pct), 6)
-                tp_target   = kc_mid if tp_mid_dist >= bar_close * take_profit_pct else tp_fallback
-            else:
-                tp_mid_dist = max(bar_close - kc_mid, 0)
-                tp_fallback = round(bar_close * (1 - take_profit_pct), 6)
-                tp_target   = kc_mid if tp_mid_dist >= bar_close * take_profit_pct else tp_fallback
-
-            tp_dist = abs(bar_close - tp_target) if tp_target else bar_close * take_profit_pct
-
-            # R:R gate — skip low-quality setups
-            if sl_dist > 0 and (tp_dist / sl_dist) < min_rr:
-                equity_curve.append(capital)
-                continue
-
-            risk_usd   = capital * RISK_PER_TRADE
-            size_usd   = risk_usd / stop_loss_pct
-            size_units = size_usd / bar_close if bar_close > 0 else 0
-
-            sl = round(bar_close * (1 - stop_loss_pct), 6) if action == "long" \
-                 else round(bar_close * (1 + stop_loss_pct), 6)
-
-            position = {
-                "side":        action,
-                "entry":       bar_close,
-                "size_usd":    size_usd,
-                "size_units":  size_units,
-                "sl":          sl,
-                "tp_fallback": tp_fallback,
-                "bar_in":      i,
-                "reason":      reason,
-            }
-
-        equity_curve.append(capital)
-
-    # ── Force-close open position at last bar ─────────────────────────────────
-    if position:
-        last_close = float(df.iloc[-1]["Close"])
-        if position["side"] == "long":
-            pnl = (last_close - position["entry"]) * position["size_units"]
-        else:
-            pnl = (position["entry"] - last_close) * position["size_units"]
-        capital += pnl
-        trades.append({
-            "side":    position["side"],
-            "entry":   position["entry"],
-            "exit":    round(last_close, 4),
-            "pnl":     round(pnl, 4),
-            "pnl_pct": round(pnl / position["size_usd"] * 100, 3),
-            "reason":  "end_of_data",
-            "bars":    len(df) - 1 - position["bar_in"],
-        })
+    trades, capital, equity_curve = _run_mean_reversion_sim(df, p)
 
     stats = _compute_stats(coin, trades, capital, equity_curve,
                            period, date_range_days)
@@ -538,76 +322,15 @@ def run_backtest(coin: str, coin_cfg: dict, period: str | None = None,
 def _compute_stats(coin: str, trades: list, final_capital: float,
                    equity_curve: list, period: str,
                    date_range_days: int = 60) -> dict:
-    if not trades:
-        return {"coin": coin, "total_trades": 0, "period": period,
-                "error": "no trades — setup too conservative or not enough data"}
-
-    pnls     = [t["pnl"]     for t in trades]
-    pnl_pcts = [t["pnl_pct"] / 100 for t in trades]
-
-    wins   = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
-    total  = len(pnls)
-
-    win_rate      = len(wins) / total * 100 if total else 0
-    total_pnl     = sum(pnls)
-    pct_return    = total_pnl / PAPER_CAPITAL * 100
-    avg_win       = sum(wins)   / len(wins)   if wins   else 0
-    avg_loss      = sum(losses) / len(losses) if losses else 0
-    profit_factor = abs(sum(wins) / sum(losses)) if losses and sum(losses) != 0 else float("inf")
-
-    exit_counts = {}
-    for t in trades:
-        r = t.get("reason", "unknown")
-        exit_counts[r] = exit_counts.get(r, 0) + 1
-
-    max_cl = cur = 0
-    for p in pnls:
-        cur    = cur + 1 if p <= 0 else 0
-        max_cl = max(max_cl, cur)
-
-    peak   = equity_curve[0] if equity_curve else float(PAPER_CAPITAL)
-    max_dd = 0.0
-    for v in equity_curve:
-        peak   = max(peak, v)
-        dd     = (peak - v) / peak * 100 if peak > 0 else 0
-        max_dd = max(max_dd, dd)
-
-    trades_per_year = max(1, int(total / max(date_range_days, 1) * 365))
-    rf              = 0.0434 / trades_per_year
-    excess          = [r - rf for r in pnl_pcts]
-    n               = len(excess)
-    mean_e          = sum(excess) / n
-    var             = sum((x - mean_e) ** 2 for x in excess) / max(n - 1, 1)
-    std_e           = math.sqrt(var) if var > 0 else 0.0
-    sharpe          = math.sqrt(trades_per_year) * (mean_e / std_e) if std_e > 1e-8 else 0.0
-
-    neg     = [x for x in excess if x < 0]
-    if neg:
-        ds      = math.sqrt(sum(x ** 2 for x in neg) / len(neg))
-        sortino = math.sqrt(trades_per_year) * (mean_e / ds) if ds > 1e-8 else (
-            float("inf") if mean_e > 0 else 0.0)
-    else:
-        sortino = float("inf") if mean_e > 0 else 0.0
-
-    return {
-        "coin":              coin,
-        "period":            period,
-        "total_trades":      total,
-        "win_rate":          round(win_rate,      1),
-        "total_pnl":         round(total_pnl,     2),
-        "pct_return":        round(pct_return,    2),
-        "avg_win":           round(avg_win,        2),
-        "avg_loss":          round(avg_loss,       2),
-        "profit_factor":     round(profit_factor,  2),
-        "max_consec_losses": max_cl,
-        "max_drawdown":      round(max_dd,         1),
-        "sharpe_ratio":      round(sharpe,         3),
-        "sortino_ratio":     round(sortino, 3) if sortino != float("inf") else "∞",
-        "final_capital":     round(final_capital,  2),
-        "exit_breakdown":    exit_counts,
-        "trades":            trades,
-    }
+    return compute_core_backtest_stats(
+        coin=coin,
+        trades=trades,
+        final_capital=final_capital,
+        equity_curve=equity_curve,
+        period=period,
+        date_range_days=date_range_days,
+        starting_capital=PAPER_CAPITAL,
+    )
 
 
 # ─── DISPLAY ──────────────────────────────────────────────────────────────────

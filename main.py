@@ -11,14 +11,25 @@ from datetime import datetime
 from colorama import Fore, Style, init
 init(autoreset=True)
 
-from config import COINS, TESTNET, HL_ENABLED, PAPER_CAPITAL, STOP_LOSS_PCT, MIN_EDGE, MIN_ENTRY_QUALITY, OBI_GATE, VOL_MIN_RATIO
+from config import (COINS, TESTNET, HL_ENABLED, PAPER_CAPITAL, STOP_LOSS_PCT,
+                    MIN_EDGE, MIN_ENTRY_QUALITY, OBI_GATE, VOL_MIN_RATIO,
+                    AI_ENABLED, ENTRY_QUALITY_GATE, HURST_GATE)
 from strategy import get_indicators_for_coin, print_indicators, get_trend_bias
-from ai_advisor import get_decision, print_decision
-from risk_manager import RiskManager
+from ai_advisor import get_decision, print_decision, _rule_based_signal
+from risk_manager import RiskManager, save_state
 from trader import execute_trade, close_trade, emergency_close_all, print_positions, get_hl_account_info, get_hl_obi, get_hl_positions
 from trade_log import load_trades
 from backtester import run_backtest, print_backtest_results, print_trade_list
 from optimizer import run_optimizer, run_walk_forward, load_best, print_optimizer_results, apply_best_to_config
+from multi_timeframe_strategy import MultiTimeframeAnalyzer
+from volatility_position_sizing import PositionSizer, RiskLevel
+from market_regime_detector import MarketRegimeDetector, StrategyAdaptiveManager
+from core.lifecycle import start_bot_lifecycle, stop_bot_lifecycle
+from core.monitor_loop import run_monitor_loop
+from core.scan_loop import run_bot_scan_loop
+from core.startup import sync_positions_with_hl
+from interfaces.cli_actions import open_dashboard_action, render_performance_report, render_view_positions
+import web_server
 
 # ─── GLOBALS ──────────────────────────────────────────────────────────────────
 _bot_thread: threading.Thread | None = None
@@ -27,6 +38,9 @@ _bot_running    = threading.Event()
 _risk           = RiskManager()
 _night_mode     = False
 _live_mode      = False   # False = paper, True = live (requires explicit switch)
+
+# Telegram two-way controller — initialised in start_bot(), None until then.
+_tg_controller = None
 
 BOT_INTERVAL_SEC     = 5 * 60    # scan every 5 minutes — aligned with 5m candle timeframe
 MONITOR_INTERVAL_SEC = 15        # SL/TP monitor checks every 15 seconds for scalping
@@ -109,163 +123,124 @@ def _apply_best_configs() -> None:
 
 # ─── BOT LOOP ─────────────────────────────────────────────────────────────────
 
-def _bot_loop():
-    """Background thread: scan coins, get AI advice, execute trades."""
-    _apply_best_configs()   # pull latest optimizer results into COINS in-memory
-    active = _active_coins()
-    coin_list = ", ".join(active) or "none"
-    print(Fore.GREEN + f"\n  Bot started — active coins: {coin_list}  "
-          f"(scanning every {BOT_INTERVAL_SEC//60}m)")
-    while _bot_running.is_set():
-        print(f"\n  {Fore.CYAN}[{datetime.now().strftime('%H:%M:%S')}] Scanning…")
+def _print_scan_summary(scan_results: list) -> None:
+    """
+    Print a compact end-of-scan line showing signal count + proximity table.
 
-        halted, reason = _risk.is_halted()
-        if halted:
-            print(Fore.RED + f"  Trading halted: {reason}")
-            _bot_running.wait(BOT_INTERVAL_SEC)
+    For KC coins that held, shows how close price and RSI are to the signal
+    threshold so the operator knows whether signals are imminent or distant.
+
+    Format (per KC coin):
+      COIN(L/S)  KC=+1.2%  RSI=43/40
+      - L/S  = direction of closer setup
+      - KC   = % gap between price and the relevant band
+                positive = price not yet at band  (needs to move further)
+                negative = price already past band (KC cond met)
+      - RSI  = current RSI / threshold  (signal fires when cond met for direction)
+    """
+    from datetime import datetime as _dt
+
+    n_sigs = sum(1 for _, _, a in scan_results if a in ("long", "short"))
+    next_ts = _dt.now().timestamp() + BOT_INTERVAL_SEC
+    next_str = _dt.fromtimestamp(next_ts).strftime('%H:%M:%S')
+
+    sig_color = Fore.GREEN if n_sigs else Fore.YELLOW
+    print(f"\n  {Fore.CYAN}{'─'*48}")
+    print(f"  Scan done  {sig_color}{n_sigs} signal{'s' if n_sigs != 1 else ''}{Style.RESET_ALL}"
+          f"  │  Next: {next_str}")
+
+    # ── Proximity table: KC mean-reversion holds only ──────────────────────
+    rows = []
+    for coin, ind, action in scan_results:
+        if action in ("long", "short"):
+            continue                           # already fired
+        if ind.get("strategy_type") != "mean_reversion":
             continue
 
-        for coin, cfg in active.items():
-            if not _bot_running.is_set():
-                break
+        price    = ind.get("price",    0)
+        kc_lower = ind.get("kc_lower", 0)
+        kc_upper = ind.get("kc_upper", 0)
+        rsi      = ind.get("rsi",      50)
+        rsi_os   = ind.get("rsi_oversold",   40)
+        rsi_ob   = ind.get("rsi_overbought", 60)
 
-            indicators = get_indicators_for_coin(coin, cfg)
-            if not indicators:
-                continue
+        if not price:
+            continue
 
-            print_indicators(indicators)
+        # Gap: positive = not yet at band, negative = already past band
+        long_kc_gap  = (price - kc_lower) / price * 100 if kc_lower else 99
+        short_kc_gap = (kc_upper - price) / price * 100 if kc_upper else 99
+        long_rsi_gap  = rsi - rsi_os    # positive = above threshold (need to fall)
+        short_rsi_gap = rsi_ob - rsi    # positive = below threshold (need to rise)
 
-            # Get daily trend bias for multi-timeframe context
-            daily_bias = get_trend_bias(coin, cfg)
-            if daily_bias["trend"] != "neutral":
-                bias_color = Fore.GREEN if daily_bias["trend"] == "bullish" else Fore.RED
-                print(f"  Daily bias: {bias_color}{daily_bias['trend'].upper()}{Style.RESET_ALL}"
-                      f"  (RSI {daily_bias['rsi']:.1f}, MA {daily_bias['ma_alignment']})")
+        # Pick the side with the smaller combined distance
+        long_score  = long_kc_gap  + max(0, long_rsi_gap)  * 0.5
+        short_score = short_kc_gap + max(0, short_rsi_gap) * 0.5
 
-            # Get AI decision — pass last 20 closed trades so the AI can
-            # factor in recent win/loss streak when sizing conviction.
-            recent = load_trades()[-20:]
-            decision = get_decision(indicators, recent, daily_bias=daily_bias)
-            print_decision(decision)
+        if long_score <= short_score:
+            side, kc_gap, cur_rsi, thresh = "L", long_kc_gap,  rsi, rsi_os
+        else:
+            side, kc_gap, cur_rsi, thresh = "S", short_kc_gap, rsi, rsi_ob
 
-            action        = decision.get("action", "hold")
-            confidence    = float(decision.get("confidence", 0.5))
-            strategy_type = cfg.get("strategy_type", "mean_reversion")
+        rows.append((long_score if side == "L" else short_score,
+                     coin, side, kc_gap, cur_rsi, thresh))
 
-            # ── Gate 1: Edge gate — confidence must exceed base win rate ─────
-            # Adapts the prediction-market "trade only when edge > 0.04" rule.
-            # Base rate = observed win rate from recent history (≥10 trades),
-            # otherwise defaults to 50%.  Prevents entering when the AI is
-            # barely beating chance.
-            if action in ("long", "short"):
-                recent_trades = load_trades()
-                if len(recent_trades) >= 10:
-                    wins_hist = sum(1 for t in recent_trades if float(t["pnl"]) > 0)
-                    base_wr   = wins_hist / len(recent_trades)
-                else:
-                    base_wr = 0.50
-                edge = confidence - base_wr
-                if edge < MIN_EDGE:
-                    print(Fore.YELLOW + f"  {coin}: Edge gate — conf {confidence:.2f} "
-                          f"− base_wr {base_wr:.2f} = {edge:+.2f} < {MIN_EDGE:.2f} — skipping")
-                    action = "hold"
+    if not rows:
+        return
 
-            # ── Gate 2: Entry quality z-score (mean-reversion only) ──────────
-            # Ensures price is meaningfully outside the KC band, not just
-            # touching the edge.  z = ATRs beyond the band at entry.
-            if action in ("long", "short") and strategy_type == "mean_reversion":
-                price_now  = indicators.get("price", 0)
-                kc_upper   = indicators.get("kc_upper", 0)
-                kc_lower   = indicators.get("kc_lower", 0)
-                atr_val    = indicators.get("atr", 0)
-                if atr_val and atr_val > 0 and price_now > 0:
-                    if action == "short" and kc_upper:
-                        z_score = (price_now - kc_upper) / atr_val
-                    elif action == "long" and kc_lower:
-                        z_score = (kc_lower - price_now) / atr_val
-                    else:
-                        z_score = MIN_ENTRY_QUALITY   # can't compute — pass through
-                    if z_score < MIN_ENTRY_QUALITY:
-                        print(Fore.YELLOW + f"  {coin}: Entry quality gate — "
-                              f"z={z_score:.3f} ATRs outside band "
-                              f"(need ≥{MIN_ENTRY_QUALITY:.2f}) — skipping")
-                        action = "hold"
+    rows.sort(key=lambda r: r[0])
+    parts = []
+    for _, coin, side, kc_gap, cur_rsi, thresh in rows[:5]:
+        # Colour by proximity: green ≤ 0.5% away, yellow ≤ 1.5%, white otherwise
+        kc_color  = (Fore.GREEN  if kc_gap  <= 0.0 else
+                     Fore.GREEN  if kc_gap  <= 0.5 else
+                     Fore.YELLOW if kc_gap  <= 1.5 else Fore.WHITE)
+        rsi_color = (Fore.GREEN  if (side == "L" and cur_rsi <= thresh) or
+                                    (side == "S" and cur_rsi >= thresh) else
+                     Fore.YELLOW if abs(cur_rsi - thresh) <= 3          else Fore.WHITE)
+        kc_str  = f"{kc_gap:+.1f}%" if kc_gap > 0 else f"{kc_gap:.1f}%"
+        parts.append(f"{Fore.CYAN}{coin}{Style.RESET_ALL}({side})"
+                     f" KC={kc_color}{kc_str}{Style.RESET_ALL}"
+                     f" RSI={rsi_color}{cur_rsi:.0f}/{thresh}{Style.RESET_ALL}")
 
-            # ── Gate 3: R:R / flip-close (existing logic) ────────────────────
-            if action in ("long", "short"):
-                if strategy_type == "mean_reversion":
-                    # R:R gate: KC midline must be ≥ 1.2× SL away
-                    price_now = indicators.get("price", 0)
-                    kc_mid    = indicators.get("kc_mid", 0)
-                    sl_pct    = cfg.get("stop_loss_pct", STOP_LOSS_PCT)
-                    sl_dist   = price_now * sl_pct
-                    tp_dist   = abs(kc_mid - price_now) if kc_mid else 0
-                    if kc_mid and tp_dist < 1.2 * sl_dist:
-                        print(Fore.YELLOW + f"  {coin}: R:R gate — midline "
-                              f"{tp_dist/price_now*100:.2f}% away, need "
-                              f"≥{1.2*sl_pct*100:.2f}% — skipping")
-                        action = "hold"
-                else:
-                    # Supertrend: flip-close existing opposite position
-                    open_pos  = _risk.state.get("positions", {}).get(coin)
-                    open_side = open_pos.get("side") if open_pos else None
-                    if open_side and open_side != action:
-                        print(Fore.YELLOW + f"  {coin}: ST flip — closing "
-                              f"{open_side} before opening {action}")
-                        close_trade(coin, _risk, reason="st_flip")
+    print(f"  Watching:  {'  │  '.join(parts)}")
 
-            # ── Gate 4: Order Book Imbalance (microstructure agreement) ─────────
-            # OBI = (bid_vol - ask_vol) / total across top 10 book levels.
-            # If the order book strongly disagrees with signal direction, skip:
-            #   SHORT signal + heavy bid pressure (OBI > OBI_GATE) → skip
-            #   LONG  signal + heavy ask pressure (OBI < -OBI_GATE) → skip
-            # Falls through if OBI is unavailable (don't block on data errors).
-            if action in ("long", "short") and HL_ENABLED:
-                hl_sym = cfg.get("hl_symbol", coin)
-                obi    = get_hl_obi(hl_sym)
-                if obi is not None:
-                    obi_blocks = ((action == "short" and obi >  OBI_GATE) or
-                                  (action == "long"  and obi < -OBI_GATE))
-                    obi_color  = Fore.RED if obi_blocks else Fore.GREEN
-                    print(f"  {coin}: OBI={obi_color}{obi:+.3f}{Style.RESET_ALL}"
-                          f"  ({'blocks' if obi_blocks else 'agrees'})")
-                    if obi_blocks:
-                        print(Fore.YELLOW + f"  {coin}: OBI gate — book pressure "
-                              f"opposes {action} (OBI={obi:+.3f}, gate=±{OBI_GATE}) — skipping")
-                        action = "hold"
 
-            # ── Gate 5: Volume filter (mean-reversion only) ───────────────────
-            # Skip entries on thin/quiet bars where a KC band touch is likely
-            # noise.  vol_ratio = current bar volume / 20-bar average volume.
-            # Low-volume band touches have a much higher false-positive rate.
-            if action in ("long", "short") and strategy_type == "mean_reversion":
-                vol_ratio = indicators.get("vol_ratio", 1.0)
-                if vol_ratio < VOL_MIN_RATIO:
-                    print(Fore.YELLOW + f"  {coin}: Volume gate — bar volume only "
-                          f"{vol_ratio:.2f}× avg (need ≥{VOL_MIN_RATIO}×) — skipping")
-                    action = "hold"
-
-            if action in ("long", "short"):
-                allowed, reason = _risk.can_open_position(coin)
-                if allowed:
-                    execute_trade(coin, action, cfg["hl_size"], _risk,
-                                  vol_regime=indicators.get("vol_regime", "normal"),
-                                  kc_mid=indicators.get("kc_mid", 0.0),
-                                  ai_confidence=confidence)
-                else:
-                    print(Fore.YELLOW + f"  Skipping {coin}: {reason}")
-            else:
-                print(Fore.YELLOW + f"  {coin}: holding — {decision.get('reason', '')}")
-
-            time.sleep(2)  # small delay between coins to avoid rate limits
-
-        # Wait for next interval (interruptible)
-        for _ in range(BOT_INTERVAL_SEC):
-            if not _bot_running.is_set():
-                break
-            time.sleep(1)
-
-    print(Fore.YELLOW + "\n  Bot stopped.")
+def _bot_loop():  # NOTE: bot loop updated to skip empty trades
+    """Background thread: scan coins, get AI advice, execute trades."""
+    run_bot_scan_loop(
+        apply_best_configs=_apply_best_configs,
+        active_coins=_active_coins,
+        bot_running=_bot_running,
+        risk_manager=_risk,
+        tg_controller=_tg_controller,
+        web_is_paused=web_server.is_paused,
+        ai_enabled=AI_ENABLED,
+        load_trades=load_trades,
+        get_indicators_for_coin=get_indicators_for_coin,
+        print_indicators=print_indicators,
+        get_trend_bias=get_trend_bias,
+        get_decision=get_decision,
+        rule_based_signal=_rule_based_signal,
+        print_decision=print_decision,
+        min_edge=MIN_EDGE,
+        entry_quality_gate=ENTRY_QUALITY_GATE,
+        min_entry_quality=MIN_ENTRY_QUALITY,
+        stop_loss_pct=STOP_LOSS_PCT,
+        hl_enabled=HL_ENABLED,
+        get_hl_obi=get_hl_obi,
+        obi_gate=OBI_GATE,
+        vol_min_ratio=VOL_MIN_RATIO,
+        close_trade=close_trade,
+        execute_trade=execute_trade,
+        add_log=web_server.add_log,
+        print_scan_summary=_print_scan_summary,
+        sleep=time.sleep,
+        bot_interval_sec=BOT_INTERVAL_SEC,
+        print_fn=print,
+        fore=Fore,
+        style=Style,
+    )
 
 
 # ─── SL/TP MONITOR LOOP ────────────────────────────────────────────────────────
@@ -276,50 +251,24 @@ def _monitor_loop():
     Closes any position that has hit its stop-loss or take-profit level.
     Runs independently from the bot scan loop.
     """
-    while _bot_running.is_set():
-        positions = dict(_risk.state.get("positions", {}))  # snapshot
-        for coin, pos in positions.items():
-            price = None
-            try:
-                from trader import get_hl_price
-                price = get_hl_price(coin) if HL_ENABLED else None
-                if not price:
-                    from strategy import get_indicators_for_coin
-                    from config import COINS
-                    ind   = get_indicators_for_coin(coin, COINS[coin]) if coin in COINS else None
-                    price = ind["price"] if ind else None
-            except Exception:
-                pass
+    from trader import close_trade, get_hl_price
+    from strategy import get_indicators_for_coin
+    from config import COINS
 
-            if not price:
-                continue
-
-            sl = pos.get("stop_loss")
-            tp = pos.get("take_profit")
-            side = pos.get("side", "long")
-
-            hit = None
-            if side == "long":
-                if sl and price <= sl:
-                    hit = "stop loss"
-                elif tp and price >= tp:
-                    hit = "take profit"
-            else:  # short
-                if sl and price >= sl:
-                    hit = "stop loss"
-                elif tp and price <= tp:
-                    hit = "take profit"
-
-            if hit:
-                print(f"\n  {Fore.YELLOW}[Monitor] {coin} hit {hit} at ${price:,.4f} — closing…")
-                from trader import close_trade
-                close_trade(coin, _risk, reason=hit)
-
-        # Wait interruptibly
-        for _ in range(MONITOR_INTERVAL_SEC):
-            if not _bot_running.is_set():
-                return
-            time.sleep(1)
+    run_monitor_loop(
+        bot_running=_bot_running,
+        risk_manager=_risk,
+        hl_enabled=HL_ENABLED,
+        get_hl_price=get_hl_price,
+        get_indicator_price=lambda coin: (
+            (get_indicators_for_coin(coin, COINS[coin]) if coin in COINS else None) or {}
+        ).get("price"),
+        close_trade=close_trade,
+        monitor_interval_sec=MONITOR_INTERVAL_SEC,
+        sleep=time.sleep,
+        print_fn=print,
+        fore=Fore,
+    )
 
 
 # ─── MENU ACTIONS ─────────────────────────────────────────────────────────────
@@ -332,62 +281,44 @@ def _sync_positions_with_hl() -> None:
     - HL open, local missing → opened externally or state file was wiped.
       Warn only — we don't have entry price/SL/TP to reconstruct the position.
     """
-    if not HL_ENABLED:
-        return
-    try:
-        hl_positions = get_hl_positions()
-        hl_coins     = {p["position"]["coin"]
-                        for p in hl_positions
-                        if float(p["position"].get("szi", 0)) != 0}
-        local_coins  = set(_risk.state.get("positions", {}).keys())
-
-        # Map local coin names → HL symbols for comparison
-        local_hl_symbols = {cfg.get("hl_symbol", c): c
-                            for c, cfg in COINS.items()
-                            if c in local_coins}
-
-        # Local open but not on HL → was closed externally
-        for hl_sym, local_coin in local_hl_symbols.items():
-            if hl_sym not in hl_coins:
-                _risk.state["positions"].pop(local_coin, None)
-                _risk._save_state()
-                print(Fore.YELLOW + f"  [sync] {local_coin} was closed on HL while bot "
-                      f"was down — removed from local state. Bot will re-enter on next signal.")
-
-        # On HL but not locally tracked → warn
-        for hl_sym in hl_coins:
-            if hl_sym not in local_hl_symbols:
-                print(Fore.YELLOW + f"  [sync] WARNING: {hl_sym} is open on HL but not "
-                      f"tracked locally. Close it manually in HL or it will be unmonitored.")
-
-        if not (hl_coins ^ set(local_hl_symbols)):
-            print(Fore.GREEN + "  [sync] Local state matches HL positions ✓")
-
-    except Exception as e:
-        print(Fore.YELLOW + f"  [sync] Could not sync with HL on startup: {e}")
+    sync_positions_with_hl(
+        hl_enabled=HL_ENABLED,
+        risk=_risk,
+        coins=COINS,
+        get_hl_positions=get_hl_positions,
+        save_state=save_state,
+        printer=print,
+        fore=Fore,
+    )
 
 
 def start_bot():
-    global _bot_thread, _monitor_thread
-    if _bot_running.is_set():
-        print(Fore.YELLOW + "  Bot is already running.")
-        return
-    print(Fore.CYAN + "  Syncing local state with HL positions…")
-    _sync_positions_with_hl()
-    _bot_running.set()
-    _bot_thread     = threading.Thread(target=_bot_loop,    daemon=True)
-    _monitor_thread = threading.Thread(target=_monitor_loop, daemon=True)
-    _bot_thread.start()
-    _monitor_thread.start()
-    print(Fore.GREEN + "  SL/TP monitor started (checks every 2 min).")
+    global _bot_thread, _monitor_thread, _tg_controller
+    from telegram_bot import TelegramController
+    from trader import close_trade, emergency_close_all
+
+    _bot_thread, _monitor_thread, _tg_controller = start_bot_lifecycle(
+        bot_running=_bot_running,
+        sync_positions=_sync_positions_with_hl,
+        telegram_controller_factory=TelegramController,
+        risk_manager=_risk,
+        close_fn=close_trade,
+        closeall_fn=emergency_close_all,
+        bot_loop=_bot_loop,
+        monitor_loop=_monitor_loop,
+        printer=print,
+        fore=Fore,
+    )
 
 
 def stop_bot():
-    if not _bot_running.is_set():
-        print(Fore.YELLOW + "  Bot is not running.")
-        return
-    _bot_running.clear()
-    print(Fore.YELLOW + "  Stopping bot… (finishes current scan)")
+    global _tg_controller
+    _tg_controller = stop_bot_lifecycle(
+        bot_running=_bot_running,
+        tg_controller=_tg_controller,
+        printer=print,
+        fore=Fore,
+    )
 
 
 def switch_to_live():
@@ -408,36 +339,15 @@ def switch_to_live():
 
 
 def view_positions():
-    print_positions(_risk)
-    _risk.print_summary()
-
-    # Show live Hyperliquid wallet balance
-    print(f"\n  {Fore.CYAN}{'─'*44}")
-    net_label = Fore.YELLOW + "TESTNET" if TESTNET else Fore.RED + "MAINNET"
-    print(f"  {Fore.CYAN}Hyperliquid Wallet [{net_label}{Fore.CYAN}]" + Style.RESET_ALL)
-    acct = get_hl_account_info()
-    if acct:
-        print(f"  Total equity   : {Fore.GREEN}${acct.get('account_value', 0):,.2f}{Style.RESET_ALL}")
-        print(f"    Spot USDC    : ${acct.get('spot_usdc', 0):,.2f}")
-        print(f"    Perps equity : ${acct.get('perps_equity', 0):,.2f}")
-        print(f"  Margin used    : ${acct.get('margin_used', 0):,.2f}")
-        print(f"  Withdrawable   : ${acct.get('withdrawable', 0):,.2f}")
-        hl_positions = acct.get("positions", [])
-        if hl_positions:
-            print(f"  Open on-chain  :")
-            for p in hl_positions:
-                pos       = p.get("position", {})
-                coin      = pos.get("coin", "?")
-                size      = pos.get("szi", "0")
-                pnl       = float(pos.get("unrealizedPnl", 0))
-                entry     = float(pos.get("entryPx", 0))
-                pnl_color = Fore.GREEN if pnl >= 0 else Fore.RED
-                print(f"    {coin:4}  size={size}  entry=${entry:,.4f}  "
-                      f"uPnL={pnl_color}${pnl:+,.2f}{Style.RESET_ALL}")
-        else:
-            print(f"  Open on-chain  : none")
-    else:
-        print(Fore.RED + "  Could not fetch wallet info — check credentials and connection.")
+    render_view_positions(
+        risk_manager=_risk,
+        print_positions=print_positions,
+        get_hl_account_info=get_hl_account_info,
+        testnet=TESTNET,
+        printer=print,
+        fore=Fore,
+        style=Style,
+    )
 
 
 def set_capital():
@@ -451,7 +361,6 @@ def set_capital():
         if confirm == "y":
             _risk.state["capital"]     = val
             _risk.state["equity_peak"] = max(_risk.state["equity_peak"], val)
-            from risk_manager import save_state
             save_state(_risk.state)
             print(Fore.GREEN + f"  Capital updated to ${val:,.2f}")
     except ValueError:
@@ -461,11 +370,29 @@ def set_capital():
 def market_analysis():
     active = _active_coins()
     disabled = [c for c in COINS if c not in active]
-    label = "active coins"
-    if disabled:
-        label += f"  ({Fore.YELLOW}disabled: {', '.join(disabled)}{Fore.CYAN})"
-    print(f"\n  {Fore.CYAN}Market Analysis — {label}{Style.RESET_ALL}")
-    for coin, cfg in active.items():
+    coin_keys = list(active.keys())
+
+    # ── Coin selection ────────────────────────────────────────────────────────
+    disabled_str = (f"  ({Fore.YELLOW}disabled: {', '.join(disabled)}{Fore.CYAN})"
+                    if disabled else "")
+    print(f"\n  {Fore.CYAN}Market Analysis{disabled_str}{Style.RESET_ALL}")
+    print(f"  Active coins: {', '.join(coin_keys)}")
+    print(f"  Enter coin(s) comma-separated, or A for all, or Q to cancel:")
+    raw = input("  > ").strip().upper()
+
+    if raw in ("Q", ""):
+        return
+
+    if raw == "A":
+        selected = coin_keys
+    else:
+        selected = [c.strip() for c in raw.split(",") if c.strip() in active]
+        if not selected:
+            print(Fore.RED + "  No valid coins entered.")
+            return
+
+    for coin in selected:
+        cfg = active[coin]
         print(Fore.YELLOW + f"\n  Fetching {coin}…")
         indicators = get_indicators_for_coin(coin, cfg)
         if not indicators:
@@ -473,12 +400,8 @@ def market_analysis():
             continue
         print_indicators(indicators)
         daily_bias = get_trend_bias(coin, cfg)
-        if daily_bias["trend"] != "neutral":
-            bias_color = Fore.GREEN if daily_bias["trend"] == "bullish" else Fore.RED
-            print(f"  Daily bias: {bias_color}{daily_bias['trend'].upper()}{Style.RESET_ALL}"
-                  f"  (RSI {daily_bias['rsi']:.1f}, MA {daily_bias['ma_alignment']})")
-        decision = get_decision(indicators, daily_bias=daily_bias)
-        print_decision(decision)
+        decision   = get_decision(indicators, daily_bias=daily_bias)
+        print_decision(decision, daily_bias=daily_bias)
 
 
 def toggle_night_mode():
@@ -488,17 +411,15 @@ def toggle_night_mode():
 
 
 def open_dashboard():
-    try:
-        import dashboard
-        path = dashboard.run()
-        if path and path.exists():
-            url = f"file://{path}"
-            webbrowser.open(url)
-            print(Fore.GREEN + f"  Dashboard opened → {path.name}")
-        else:
-            print(Fore.RED + "  Dashboard generation failed.")
-    except Exception as e:
-        print(Fore.RED + f"  Dashboard error: {e}")
+    """Open the enhanced live dashboard in the default browser."""
+    import webbrowser
+
+    open_dashboard_action(
+        module_file=__file__,
+        browser_open=webbrowser.open,
+        printer=print,
+        fore=Fore,
+    )
 
 
 def ask_bot():
@@ -592,64 +513,13 @@ def fetch_historical():
 
 def performance_report():
     from trade_log import performance_report as _perf, load_trades
-    print(f"\n  {Fore.CYAN}Performance Report")
-    print(f"  {Fore.CYAN}{'─'*44}")
-
-    stats = _perf()
-    if not stats:
-        print(Fore.YELLOW + "  No closed trades yet.")
-        return
-
-    pnl_color = Fore.GREEN if stats["total_pnl"] >= 0 else Fore.RED
-    pf_str    = (f"{stats['profit_factor']:.2f}"
-                 if stats["profit_factor"] != float("inf") else "∞")
-
-    print(f"  Trades:          {stats['total_trades']}")
-    print(f"  Win rate:        {Fore.GREEN if stats['win_rate'] >= 50 else Fore.RED}"
-          f"{stats['win_rate']:.1f}%{Style.RESET_ALL}")
-    print(f"  Total P&L:       {pnl_color}${stats['total_pnl']:+,.2f}{Style.RESET_ALL}")
-    print(f"  Avg win:         {Fore.GREEN}${stats['avg_win']:,.2f}{Style.RESET_ALL}")
-    print(f"  Avg loss:        {Fore.RED}${stats['avg_loss']:,.2f}{Style.RESET_ALL}")
-    print(f"  Profit factor:   {pf_str}")
-    print(f"  Max drawdown:    {Fore.RED}{stats['max_drawdown']:.1f}%{Style.RESET_ALL}")
-    print(f"  Max consec loss: {stats['max_consec_losses']}")
-    print(f"  Best trade:      {Fore.GREEN}${stats['best_trade']:+,.2f}{Style.RESET_ALL}")
-    print(f"  Worst trade:     {Fore.RED}${stats['worst_trade']:+,.2f}{Style.RESET_ALL}")
-
-    sharpe  = stats.get("sharpe_ratio", 0)
-    sortino = stats.get("sortino_ratio", 0)
-    s_color = Fore.GREEN if sharpe  >= 1.0 else Fore.YELLOW if sharpe  > 0 else Fore.RED
-    o_color = Fore.GREEN if sortino >= 1.5 else Fore.YELLOW if sortino > 0 else Fore.RED
-    sortino_str = f"{sortino:.3f}" if sortino != float("inf") else "∞"
-    print(f"  Sharpe ratio:    {s_color}{sharpe:.3f}{Style.RESET_ALL}"
-          f"  {'✓ good' if sharpe >= 1.0 else '○ target ≥ 1.0'}")
-    print(f"  Sortino ratio:   {o_color}{sortino_str}{Style.RESET_ALL}"
-          f"  {'✓ good' if sortino >= 1.5 else '○ target ≥ 1.5'}")
-
-    # Brier Score — AI confidence calibration (lower = better)
-    brier = stats.get("brier_score")
-    n_cal = stats.get("calibrated_trades", 0)
-    if brier is not None:
-        # 0.25 = random, <0.20 = decent, <0.15 = well calibrated
-        b_color = (Fore.GREEN  if brier < 0.15 else
-                   Fore.YELLOW if brier < 0.20 else Fore.RED)
-        b_grade = ("✓ well calibrated" if brier < 0.15 else
-                   "○ decent"          if brier < 0.20 else
-                   "✗ overconfident / poorly calibrated")
-        print(f"  Brier score:     {b_color}{brier:.4f}{Style.RESET_ALL}"
-              f"  {b_grade}  (n={n_cal}, 0=perfect, 0.25=random)")
-    else:
-        print(f"  Brier score:     {Fore.YELLOW}— (need ≥5 trades with confidence logged){Style.RESET_ALL}")
-
-    # Show last 5 trades
-    trades = load_trades()[-5:]
-    if trades:
-        print(f"\n  {Fore.CYAN}Last {len(trades)} trades:")
-        for t in trades:
-            pnl = float(t["pnl"])
-            c   = Fore.GREEN if pnl >= 0 else Fore.RED
-            print(f"  {t['timestamp'][:16]}  {t['coin']:4} {t['side'].upper():5} "
-                  f"{c}${pnl:+,.2f}{Style.RESET_ALL}  ({t['reason']})")
+    render_performance_report(
+        performance_report_fn=_perf,
+        load_trades=load_trades,
+        printer=print,
+        fore=Fore,
+        style=Style,
+    )
 
 
 def optimize():
@@ -725,6 +595,7 @@ def emergency_stop():
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
+    web_server.start()   # live dashboard available at http://localhost:5000
     while True:
         _clear()
         _header()
@@ -772,11 +643,22 @@ def main():
         input(f"\n  {Fore.WHITE}Press Enter to continue…{Style.RESET_ALL}")
 
 
+# ── Wire web server (module level — runs whether bot is started or not) ────────
+web_server.init(
+    risk         = _risk,
+    bot_running  = _bot_running,
+    start_fn     = start_bot,
+    stop_fn      = stop_bot,
+    close_fn     = close_trade,
+    emergency_fn = emergency_close_all,
+)
+
 if __name__ == "__main__":
     # When launched by launchd (non-interactively), auto-start the bot loop
     # and keep the process alive. Pass --autostart to enable this mode.
     if "--autostart" in sys.argv:
         print(Fore.GREEN + "  [autostart] Starting bot in non-interactive mode…")
+        web_server.start()
         start_bot()
         try:
             while True:

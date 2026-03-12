@@ -6,19 +6,17 @@ Each coin is optimized independently using its own timeframe from config:
   - BTC: 1h / 365d  — same
   - SOL: 5m / 60d   — fast scalp timeframe
 
-Grid sweeps 288 combos per coin:
+Grid sweeps 72 combos per coin:
   kc_scalar       : [1.0, 1.25, 1.5, 2.0]
   rsi_oversold    : [35, 40, 45]         (rsi_overbought = 100 - rsi_oversold)
   ma_trend_filter : [True, False]
   stop_loss_pct   : [0.002, 0.003, 0.004]   (0.1% removed — unrealistic live)
-  hurst_cap       : [0.45, 0.50, 0.55, 0.65]
-= 4 × 3 × 2 × 3 × 4 = 288 combos per coin
-
-hurst_cap is now gridded. Previous runs fixed it at 0.65 because observed
-Hurst rarely exceeded 0.60; however those runs pre-dated per-coin RSI and
-the structural MA_filter changes. Sweeping [0.45, 0.50, 0.55, 0.65] tests
-whether tighter regime filtering (lower cap = more selective) improves
-signal quality by excluding borderline trending periods.
+  hurst_cap       : [0.45]               (pinned — all 4 cap values produced identical
+                                          results across 9 coins in the Mar-2026 run;
+                                          Hurst never exceeded 0.45 in any 60d window.
+                                          Restore to [0.45, 0.50, 0.55, 0.65] if regime
+                                          conditions change significantly.)
+= 4 × 3 × 2 × 3 × 1 = 72 combos per coin
 
 Performance: O(n) per simulation — all indicators precomputed as numpy arrays.
 Each bar is a pure Python comparison + arithmetic; no pandas_ta inside the loop.
@@ -38,7 +36,7 @@ from pathlib import Path
 from colorama import Fore, Style
 
 from backtester import _fetch, _DEFAULT_SIM_PARAMS
-from config import COINS, PAPER_CAPITAL, RISK_PER_TRADE, BEST_CONFIGS_FILE
+from config import COINS, PAPER_CAPITAL, RISK_PER_TRADE, BEST_CONFIGS_FILE, HL_MAX_POSITION_USD
 from config import KC_PERIOD, MA_TREND, RSI_PERIOD
 
 
@@ -60,7 +58,7 @@ GRID = {
     "rsi_oversold":    [35, 40, 45],
     "ma_trend_filter": [True, False],
     "stop_loss_pct":   [0.002, 0.003, 0.004],
-    "hurst_cap":       [0.45, 0.50, 0.55, 0.65],
+    "hurst_cap":       [0.45],   # pinned — see docstring above
 }
 
 # Supertrend grid: period × multiplier × sl = 3 × 4 × 3 = 36 combos
@@ -376,8 +374,11 @@ def _fast_sim(cache: "_CoinCache", params: dict,
                 equity_curve.append(capital)
                 continue
 
-            risk_usd   = capital * RISK_PER_TRADE
-            size_usd   = risk_usd / sl_pct
+            # Fixed-capital sizing: use starting PAPER_CAPITAL, not running equity.
+            # Prevents compounding from inflating notional (and thus PnL) across
+            # thousands of trades.  Cap at HL_MAX_POSITION_USD to match live bot.
+            risk_usd   = float(PAPER_CAPITAL) * RISK_PER_TRADE
+            size_usd   = min(risk_usd / sl_pct, HL_MAX_POSITION_USD)
             size_units = size_usd / bar_close if bar_close > 0 else 0
 
             sl = (bar_close * (1 - sl_pct) if action == "long"
@@ -541,8 +542,9 @@ def _fast_sim_supertrend(cache: "_CoinCache", params: dict,
         action = "long" if d_now == 1 else "short"
         sl     = (bar_close * (1 - sl_pct) if action == "long"
                   else bar_close * (1 + sl_pct))
-        risk_usd   = capital * RISK_PER_TRADE
-        size_usd   = risk_usd / sl_pct
+        # Fixed-capital sizing — same fix as mean-reversion sim above.
+        risk_usd   = float(PAPER_CAPITAL) * RISK_PER_TRADE
+        size_usd   = min(risk_usd / sl_pct, HL_MAX_POSITION_USD)
         size_units = size_usd / bar_close if bar_close > 0 else 0
 
         position = {

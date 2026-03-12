@@ -8,26 +8,23 @@ from datetime import datetime, date
 from colorama import Fore, Style
 from config import (
     RISK_PER_TRADE, STOP_LOSS_PCT, TAKE_PROFIT_PCT,
-    MAX_OPEN_POSITIONS, MAX_DAILY_LOSS, MAX_DRAWDOWN,
-    STATE_FILE, AI_CONFIDENCE_THRESHOLD, KELLY_FRACTION
+    MAX_OPEN_POSITIONS, MAX_POSITIONS_SIDE, MAX_DAILY_LOSS, MAX_DRAWDOWN,
+    STATE_FILE, AI_CONFIDENCE_THRESHOLD, KELLY_FRACTION, HL_FEE_RATE
 )
+from shared.state import load_state as _load_json_state, save_state as _save_json_state
 
 
 def load_state() -> dict:
-    defaults = _default_state()
-    try:
-        with open(STATE_FILE) as f:
-            loaded = json.load(f)
-        # Merge: fill in any keys missing from old state files
-        defaults.update(loaded)
-        return defaults
-    except (FileNotFoundError, json.JSONDecodeError):
-        return defaults
+    return _load_json_state(
+        STATE_FILE,
+        defaults=_default_state,
+        merge_defaults=True,
+        fallback_exceptions=(FileNotFoundError, json.JSONDecodeError),
+    )
 
 
 def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2, default=str)
+    _save_json_state(STATE_FILE, state, json_default=str)
 
 
 def _default_state() -> dict:
@@ -86,17 +83,36 @@ class RiskManager:
 
         return False, ""
 
-    def can_open_position(self, coin: str) -> tuple[bool, str]:
-        """Check whether we're allowed to open a new position."""
+    def can_open_position(self, coin: str, side: str = "") -> tuple[bool, str]:
+        """Check whether we're allowed to open a new position.
+
+        side: "long" or "short" — used for the per-side cap check.
+        If omitted, the per-side cap is skipped (backward-compatible).
+        """
+        from config import COINS as _COINS
         halted, reason = self.is_halted()
         if halted:
             return False, reason
 
-        if coin in self.state["positions"]:
-            return False, f"Already have an open position in {coin}"
+        # Block by hl_symbol uniqueness — prevents e.g. SOL (KC 5m) and SOL_ST
+        # (ST 1h) from both opening positions on the same underlying HL asset.
+        requested_hl = _COINS.get(coin, {}).get("hl_symbol", coin)
+        for existing_coin in self.state["positions"]:
+            existing_hl = _COINS.get(existing_coin, {}).get("hl_symbol", existing_coin)
+            if existing_hl == requested_hl:
+                return False, f"Already have an open position in {requested_hl} ({existing_coin})"
 
         if len(self.state["positions"]) >= MAX_OPEN_POSITIONS:
             return False, f"Max open positions ({MAX_OPEN_POSITIONS}) reached"
+
+        # Per-side cap: prevent correlated pile-on (e.g. 6 simultaneous shorts into a rally)
+        if side in ("long", "short"):
+            same_side = sum(
+                1 for pos in self.state["positions"].values()
+                if pos.get("side") == side
+            )
+            if same_side >= MAX_POSITIONS_SIDE:
+                return False, f"Max {side} positions ({MAX_POSITIONS_SIDE}) reached — correlated exposure cap"
 
         return True, ""
 
@@ -156,12 +172,15 @@ class RiskManager:
             corr_scalar = max(0.25, 1.0 - open_correlated * self._CORRELATION_PENALTY)
 
         # ── 3. Kelly scalar (confidence-proportional sizing) ───────────────────
-        # f* = (p·b − q) / b  where  b = tp_pct/sl_pct (R:R),  p = confidence
-        # Use threshold confidence as the 1.0× reference so every trade that
-        # already passed the confidence gate is sized at ≥1.0× baseline.
-        # SuperTrend coins have no fixed tp_pct — use 2.5 as conservative R:R.
+        # Only applied when AI is enabled and returning variable confidence scores.
+        # When AI is disabled, the rule-based signal returns a hardcoded 0.75 for
+        # every trade — Kelly on a constant is meaningless and just adds a fixed
+        # multiplier that could be baked into RISK_PER_TRADE more honestly.
+        # Bypassing it keeps sizing at 1.0× (the vol+corr adjusted base) when
+        # the confidence value carries no real information.
+        from config import AI_ENABLED
         kelly_mult = 1.0
-        if ai_confidence is not None:
+        if AI_ENABLED and ai_confidence is not None:
             b = tp_pct / sl_pct if sl_pct > 0 else 2.5
             def _kelly_f(p: float) -> float:
                 return (p * b - (1.0 - p)) / b
@@ -207,11 +226,19 @@ class RiskManager:
         # SL: long = below entry, short = above entry
         sl = sizing["stop_loss"] if side == "long" else round(price * (1 + _sl_pct), 4)
 
-        # TP: if an explicit price was passed (KC midline), use it directly for
-        # both sides — the caller already validated it's on the correct side.
-        # Otherwise fall back to fixed-pct TP.
+        # TP: if an explicit price was passed (KC midline), validate it's on the correct side
+        # before using it. Otherwise fall back to fixed-pct TP.
         if _tp_price is not None and _tp_price > 0:
-            tp = round(_tp_price, 4)
+            # For long: TP should be above entry (profitable)
+            # For short: TP should be below entry (profitable)
+            if (side == "long" and _tp_price > price) or (side == "short" and _tp_price < price):
+                tp = round(_tp_price, 4)
+            else:
+                # KC midline is on wrong side - use fixed % TP instead
+                if side == "long":
+                    tp = round(price * (1 + _tp_pct), 4)
+                else:
+                    tp = round(price * (1 - _tp_pct), 4)
         elif side == "long":
             tp = sizing["take_profit"]
         else:
@@ -236,9 +263,15 @@ class RiskManager:
             return {}
 
         if pos["side"] == "long":
-            pnl = (exit_price - pos["entry_price"]) * pos["size_units"]
+            gross_pnl = (exit_price - pos["entry_price"]) * pos["size_units"]
         else:
-            pnl = (pos["entry_price"] - exit_price) * pos["size_units"]
+            gross_pnl = (pos["entry_price"] - exit_price) * pos["size_units"]
+
+        # Deduct round-trip trading fee (entry + exit).
+        # fee = notional × HL_FEE_RATE.  Use entry size_usd as the notional proxy
+        # (exit value is nearly identical for small SL/TP moves).
+        fees = round(pos.get("size_usd", 0) * HL_FEE_RATE, 4)
+        pnl  = gross_pnl - fees
 
         self.state["capital"]      += pnl
         self.state["equity_peak"]   = max(self.state["equity_peak"], self.state["capital"])
@@ -255,7 +288,9 @@ class RiskManager:
             "side":        pos["side"],
             "entry_price": pos["entry_price"],
             "exit_price":  exit_price,
-            "pnl":         round(pnl, 2),
+            "gross_pnl":   round(gross_pnl, 2),
+            "fees":        round(fees, 4),
+            "pnl":         round(pnl, 2),           # net P&L after fees
             "pnl_pct":     round(pnl / pos["size_usd"] * 100, 2),
         }
 
