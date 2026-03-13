@@ -47,6 +47,7 @@ def get_live_price(coin: str):
             price = get_hl_price(coin)
             if price:
                 return price
+            return None
     except Exception:
         pass
     try:
@@ -60,13 +61,55 @@ def get_live_price(coin: str):
         return None
 
 
-def build_positions_data(risk, *, live_price_fn=get_live_price) -> dict:
-    if not risk:
-        return {}
+def _build_hl_positions_data(hl_account: dict, *, live_price_fn=get_live_price) -> dict:
     from config import COINS
 
     result = {}
-    for coin, pos in risk.state.get("positions", {}).items():
+    for position_wrapper in hl_account.get("positions", []):
+        pos = position_wrapper.get("position", {})
+        coin = pos.get("coin")
+        if not coin:
+            continue
+        size = float(pos.get("szi", 0) or 0)
+        if size == 0:
+            continue
+        entry = float(pos.get("entryPx", 0) or 0)
+        live_price = live_price_fn(coin)
+        unrealized = pos.get("unrealizedPnl")
+        unreal = float(unrealized) if unrealized is not None else (
+            ((live_price - entry) if size > 0 else (entry - live_price)) * abs(size)
+            if live_price and entry else None
+        )
+        result[coin] = {
+            "side": "long" if size > 0 else "short",
+            "entry_price": entry,
+            "size_units": abs(size),
+            "size_usd": round(entry * abs(size), 2),
+            "live_price": live_price,
+            "live_pnl": round(unreal, 4) if unreal is not None else None,
+            "stop_loss": None,
+            "take_profit": None,
+            "opened_at": "",
+            "strategy": COINS.get(coin, {}).get("strategy_type", ""),
+        }
+    return result
+
+
+def build_positions_data(risk, *, live_price_fn=get_live_price, hl_account: dict | None = None) -> dict:
+    if not risk:
+        risk_positions = {}
+    else:
+        risk_positions = risk.state.get("positions", {})
+    try:
+        from config import HL_ENABLED
+        if HL_ENABLED and hl_account and hl_account.get("positions"):
+            return _build_hl_positions_data(hl_account, live_price_fn=live_price_fn)
+    except Exception:
+        pass
+    from config import COINS
+
+    result = {}
+    for coin, pos in risk_positions.items():
         entry = float(pos.get("entry_price", 0))
         size_units = float(pos.get("size_units", 0))
         side = pos.get("side", "?")
@@ -88,9 +131,9 @@ def build_positions_data(risk, *, live_price_fn=get_live_price) -> dict:
     return result
 
 
-def build_positions_payload(risk, *, live_price_fn=get_live_price) -> dict:
+def build_positions_payload(risk, *, live_price_fn=get_live_price, hl_account: dict | None = None) -> dict:
     """Compatibility alias for positions payload assembly."""
-    return build_positions_data(risk, live_price_fn=live_price_fn)
+    return build_positions_data(risk, live_price_fn=live_price_fn, hl_account=hl_account)
 
 
 def build_perf_stats() -> dict:
@@ -173,7 +216,7 @@ def build_status_payload(*, risk, bot_running, paused: bool, hl_account: dict, l
         "total_pnl_pct": round(pnl / PAPER_CAPITAL * 100, 2) if PAPER_CAPITAL else 0,
         "mode": "live" if HL_ENABLED else "paper",
         "network": "testnet" if TESTNET else "mainnet",
-        "positions": build_positions_data(risk),
+        "positions": build_positions_data(risk, hl_account=hl_account),
         "last_updated": last_updated,
     }
 
@@ -186,14 +229,26 @@ def build_performance_payload(*, stats: dict, equity: dict, coins: dict) -> dict
     }
 
 
-def build_coins_payload(risk) -> dict:
+def build_coins_payload(risk, hl_account: dict | None = None) -> dict:
     from config import COINS
 
     positions = risk.state.get("positions", {}) if risk else {}
+    hl_symbols_with_positions = set()
+    if hl_account:
+        for position_wrapper in hl_account.get("positions", []):
+            pos = position_wrapper.get("position", {})
+            coin = pos.get("coin")
+            size = float(pos.get("szi", 0) or 0)
+            if coin and size != 0:
+                hl_symbols_with_positions.add(coin)
     result = {}
     for key, cfg in COINS.items():
         hl_sym = cfg.get("hl_symbol", key)
-        has_pos = any(COINS.get(c, {}).get("hl_symbol", c) == hl_sym for c in positions)
+        has_pos = (
+            hl_sym in hl_symbols_with_positions
+            if hl_symbols_with_positions
+            else any(COINS.get(c, {}).get("hl_symbol", c) == hl_sym for c in positions)
+        )
         result[key] = {
             "enabled": cfg.get("enabled", True),
             "strategy": cfg.get("strategy_type", "mean_reversion"),

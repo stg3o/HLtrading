@@ -29,6 +29,7 @@ from core.monitor_loop import run_monitor_loop
 from core.scan_loop import run_bot_scan_loop
 from core.startup import sync_positions_with_hl
 from interfaces.cli_actions import open_dashboard_action, render_performance_report, render_view_positions
+from interfaces.coin_management import apply_coin_overrides, manage_coin_overrides
 import web_server
 
 # ─── GLOBALS ──────────────────────────────────────────────────────────────────
@@ -44,6 +45,8 @@ _tg_controller = None
 
 BOT_INTERVAL_SEC     = 5 * 60    # scan every 5 minutes — aligned with 5m candle timeframe
 MONITOR_INTERVAL_SEC = 15        # SL/TP monitor checks every 15 seconds for scalping
+
+apply_coin_overrides(COINS)
 
 
 # ─── DISPLAY ──────────────────────────────────────────────────────────────────
@@ -78,6 +81,7 @@ def _menu():
     print(f"  [7] Night Mode 🌙           [8] Open Dashboard in Browser")
     print(f"  [9] Ask the Bot 💬          [10] Backtest 📊")
     print(f"  [11] Performance Report 📈  [12] Optimize Strategy 🔬")
+    print(f"  [13] Manage Coins 🪙")
     print(f"  [F] Fetch Historical Data 💾")
     print(f"  {Fore.RED}[E] EMERGENCY STOP 🔴{Style.RESET_ALL}")
     print(f"  [Q] Quit\n")
@@ -522,6 +526,16 @@ def performance_report():
     )
 
 
+def manage_coins():
+    manage_coin_overrides(
+        COINS,
+        input_fn=input,
+        printer=print,
+        fore=Fore,
+        style=Style,
+    )
+
+
 def optimize():
     """
     Per-coin grid-search optimizer — sweeps 288 combos per coin
@@ -628,6 +642,8 @@ def main():
             performance_report()
         elif choice == "12":
             optimize()
+        elif choice == "13":
+            manage_coins()
         elif choice == "F":
             fetch_historical()
         elif choice == "E":

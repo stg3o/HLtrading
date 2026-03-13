@@ -4,7 +4,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from interfaces.cli_actions import open_dashboard_action, render_performance_report, render_view_positions
 
@@ -69,10 +69,26 @@ class TestCliActions(unittest.TestCase):
         self.assertIn("Open on-chain  :", output)
         self.assertIn("ETH", output)
 
-    def test_open_dashboard_prefers_enhanced_file_then_falls_back(self):
+    def test_open_dashboard_prefers_live_web_dashboard_then_falls_back(self):
         printer = Mock()
         browser_open = Mock()
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with patch("hltrading.interfaces.cli_actions._url_available", return_value=True), \
+             tempfile.TemporaryDirectory() as tmpdir:
+            module_file = Path(tmpdir) / "main.py"
+            module_file.write_text("", encoding="utf-8")
+            open_dashboard_action(
+                module_file=str(module_file),
+                browser_open=browser_open,
+                printer=printer,
+                fore=self.fore,
+            )
+
+            browser_open.assert_called_once_with("http://localhost:5000")
+
+        printer = Mock()
+        browser_open = Mock()
+        with patch("hltrading.interfaces.cli_actions._url_available", return_value=False), \
+             tempfile.TemporaryDirectory() as tmpdir:
             module_file = Path(tmpdir) / "main.py"
             module_file.write_text("", encoding="utf-8")
             enhanced = Path(tmpdir) / "enhanced_dashboard.html"
@@ -88,9 +104,12 @@ class TestCliActions(unittest.TestCase):
             browser_open.assert_called_once()
             self.assertTrue(browser_open.call_args.args[0].startswith("file://"))
 
+    def test_open_dashboard_reports_clear_error_when_live_and_static_unavailable(self):
         printer = Mock()
         browser_open = Mock()
-        with tempfile.TemporaryDirectory() as tmpdir:
+
+        with patch("hltrading.interfaces.cli_actions._url_available", return_value=False), \
+             tempfile.TemporaryDirectory() as tmpdir:
             module_file = Path(tmpdir) / "main.py"
             module_file.write_text("", encoding="utf-8")
 
@@ -101,7 +120,9 @@ class TestCliActions(unittest.TestCase):
                 fore=self.fore,
             )
 
-            browser_open.assert_called_once_with("http://localhost:5000")
+        output = "\n".join(call.args[0] for call in printer.call_args_list)
+        browser_open.assert_not_called()
+        self.assertIn("No dashboard could be opened.", output)
 
 
 if __name__ == "__main__":

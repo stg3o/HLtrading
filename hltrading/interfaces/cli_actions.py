@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import urllib.request
 
 
 def render_view_positions(*, risk_manager, print_positions, get_hl_account_info, testnet: bool, printer=print, fore=None, style=None) -> None:
@@ -38,26 +39,45 @@ def render_view_positions(*, risk_manager, print_positions, get_hl_account_info,
         printer(fore.RED + "  Could not fetch wallet info — check credentials and connection.")
 
 
+def _url_available(url: str) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=1.5):
+            return True
+    except Exception:
+        return False
+
+
 def open_dashboard_action(*, module_file: str, browser_open, printer=print, fore=None) -> None:
-    """Open the enhanced dashboard first, then fall back to the web dashboard."""
-    enhanced_dashboard = Path(module_file).parent / "enhanced_dashboard.html"
-    if enhanced_dashboard.exists():
+    """Open the live web dashboard first, then fall back to static HTML."""
+    url = "http://localhost:5000"
+    if _url_available(url):
         try:
-            browser_open(f"file://{enhanced_dashboard.resolve()}")
-            printer(fore.GREEN + f"  Enhanced dashboard opened → {enhanced_dashboard.name}")
-            printer(fore.CYAN + "  (Professional UI with real-time charts and analytics)")
+            browser_open(url)
+            printer(fore.GREEN + f"  Live dashboard opened → {url}")
+            printer(fore.CYAN + "  (Bot controls, positions, charts, and optimizer all available.)")
             return
         except Exception as exc:
-            printer(fore.YELLOW + f"  Could not open enhanced dashboard: {exc}")
+            printer(fore.YELLOW + f"  Could not open live dashboard in browser: {exc}")
+    else:
+        printer(fore.YELLOW + "  Live web dashboard unavailable — falling back to static dashboard.")
 
-    url = "http://localhost:5000"
-    try:
-        browser_open(url)
-        printer(fore.GREEN + f"  Live dashboard opened → {url}")
-        printer(fore.CYAN + "  (Bot controls, positions, charts, and optimizer all available.)")
-    except Exception as exc:
-        printer(fore.RED + f"  Could not open browser: {exc}")
-        printer(fore.WHITE + f"  Open manually: {url}")
+    static_candidates = (
+        Path(module_file).parent / "enhanced_dashboard.html",
+        Path(module_file).parent / "dashboard.html",
+    )
+    for dashboard_file in static_candidates:
+        if not dashboard_file.exists():
+            continue
+        try:
+            browser_open(f"file://{dashboard_file.resolve()}")
+            printer(fore.GREEN + f"  Static dashboard opened → {dashboard_file.name}")
+            return
+        except Exception as exc:
+            printer(fore.YELLOW + f"  Could not open {dashboard_file.name}: {exc}")
+
+    printer(fore.RED + "  No dashboard could be opened.")
+    printer(fore.WHITE + f"  Tried live web dashboard: {url}")
+    printer(fore.WHITE + "  Tried static files: enhanced_dashboard.html, dashboard.html")
 
 
 def render_performance_report(*, performance_report_fn, load_trades, printer=print, fore=None, style=None) -> None:

@@ -20,6 +20,7 @@ from strategy import (
     download_data, get_indicators_for_coin, get_trend_bias,
     _adx, _hurst, _momentum_score, _vol_regime, _trend_slope, _classify_regime_gate
 )
+from ai_advisor import _rule_based_signal
 
 
 class TestIndicatorCalculations(unittest.TestCase):
@@ -113,6 +114,8 @@ class TestIndicatorCalculations(unittest.TestCase):
         self.assertIn('trend_slope', indicators)
         self.assertIn('trend_slope_label', indicators)
         self.assertIn('regime_gate', indicators)
+        self.assertIn('entry_quality', indicators)
+        self.assertIn('entry_quality_side', indicators)
         
         # Check that derived labels are present
         self.assertIn('price_vs_kc', indicators)
@@ -122,6 +125,8 @@ class TestIndicatorCalculations(unittest.TestCase):
         self.assertIn('trend_strength', indicators)
         self.assertIn('market_regime', indicators)
         self.assertIn(indicators['regime_gate'], ['trend', 'mean_reversion', 'neutral'])
+        self.assertGreaterEqual(indicators['entry_quality'], 0.0)
+        self.assertIn(indicators['entry_quality_side'], ['long', 'short', 'neutral'])
     
     def test_calculate_indicators_custom_kc_scalar(self):
         """Test indicator calculation with custom KC scalar"""
@@ -177,7 +182,53 @@ class TestSupertrendCalculations(unittest.TestCase):
         self.assertIn('trend_strength', indicators)
         self.assertIn('market_regime', indicators)
         self.assertIn(indicators['regime_gate'], ['trend', 'mean_reversion', 'neutral'])
-        self.assertIn('price_vs_st', indicators)
+
+    def test_rule_based_signal_holds_in_non_mean_reversion_regime(self):
+        indicators = {
+            'strategy_type': 'mean_reversion',
+            'price': 95.0,
+            'rsi': 30.0,
+            'kc_lower': 96.0,
+            'kc_upper': 104.0,
+            'ma_trend': 90.0,
+            'hurst': 0.58,
+            'adx': 28.0,
+            'regime_gate': 'trend',
+            'entry_quality': 0.8,
+            'entry_quality_side': 'long',
+            'entry_quality_min': 0.25,
+            'trend_slope': 0.001,
+            'ma_trend_filter': True,
+            'rsi_oversold': 40,
+            'rsi_overbought': 60,
+        }
+        result = _rule_based_signal(indicators)
+        self.assertEqual(result['action'], 'hold')
+        self.assertIn('regime', result['reason'])
+
+    def test_rule_based_signal_requires_deeper_band_penetration(self):
+        indicators = {
+            'strategy_type': 'mean_reversion',
+            'price': 95.8,
+            'rsi': 30.0,
+            'kc_lower': 96.0,
+            'kc_upper': 104.0,
+            'ma_trend': 90.0,
+            'hurst': 0.40,
+            'adx': 18.0,
+            'regime_gate': 'mean_reversion',
+            'entry_quality': 0.10,
+            'entry_quality_side': 'long',
+            'entry_quality_min': 0.25,
+            'trend_slope': 0.0005,
+            'ma_trend_filter': True,
+            'rsi_oversold': 40,
+            'rsi_overbought': 60,
+            'atr': 1.0,
+        }
+        result = _rule_based_signal(indicators)
+        self.assertEqual(result['action'], 'hold')
+        self.assertIn('too shallow', result['reason'])
     
     def test_supertrend_direction_values(self):
         """Test that Supertrend direction values are correct"""

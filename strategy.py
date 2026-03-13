@@ -456,12 +456,26 @@ def calculate_indicators(df: pd.DataFrame, kc_scalar: float | None = None) -> di
             if vol_ma and vol_ma > 0:
                 vol_ratio = round(_safe(completed.iloc[-1] / vol_ma, 1.0), 3)
 
+        price_now = _safe(close.iloc[-1])
+        atr_now = _safe(atr.iloc[-1])
+        long_entry_quality = 0.0
+        short_entry_quality = 0.0
+        if atr_now > 1e-8:
+            long_entry_quality = max(0.0, (float(kc_lower.iloc[-1]) - price_now) / atr_now)
+            short_entry_quality = max(0.0, (price_now - float(kc_upper.iloc[-1])) / atr_now)
+        entry_quality = round(max(long_entry_quality, short_entry_quality), 4)
+        entry_quality_side = (
+            "long" if long_entry_quality > short_entry_quality else
+            "short" if short_entry_quality > long_entry_quality else
+            "neutral"
+        )
+
         latest = {
-            "price":    _round_price(_safe(close.iloc[-1])),
+            "price":    _round_price(price_now),
             "kc_upper": _round_price(_safe(kc_upper.iloc[-1])),
             "kc_mid":   _round_price(_safe(ema_mid.iloc[-1])),
             "kc_lower": _round_price(_safe(kc_lower.iloc[-1])),
-            "atr":      round(_safe(atr.iloc[-1]),      6),   # ATR also sub-cent for BONK/SHIB
+            "atr":      round(atr_now, 6),   # ATR also sub-cent for BONK/SHIB
             "ma_fast":  _round_price(_safe(ma_fast.iloc[-1])),
             "ma_slow":  _round_price(_safe(ma_slow.iloc[-1])),
             "ma_trend": _round_price(_safe(ma_trend.iloc[-1])),
@@ -474,6 +488,8 @@ def calculate_indicators(df: pd.DataFrame, kc_scalar: float | None = None) -> di
             "vol_regime":   vol_regime,
             "trend_slope":  trend_slope,
             "vol_ratio":    vol_ratio,   # current bar vol / 20-bar avg vol
+            "entry_quality": entry_quality,
+            "entry_quality_side": entry_quality_side,
         }
 
         # ── Derived labels for AI prompt readability ───────────────────────
@@ -563,6 +579,7 @@ def get_indicators_for_coin(coin: str, coin_cfg: dict) -> dict | None:
             indicators["interval"]        = coin_cfg["interval"]
             indicators["strategy_type"]   = "mean_reversion"
             indicators["kc_scalar"]       = coin_kc_scalar
+            indicators["entry_quality_min"] = coin_cfg.get("entry_quality_min", 0.25)
             indicators["ma_trend_filter"] = coin_cfg.get("ma_trend_filter", True)
             indicators["rsi_oversold"]    = coin_cfg.get("rsi_oversold",  RSI_OVERSOLD)
             indicators["rsi_overbought"]  = coin_cfg.get("rsi_overbought", RSI_OVERBOUGHT)

@@ -270,7 +270,11 @@ def _rule_based_signal(indicators: dict) -> dict:
     if strategy_type == "supertrend":
         return _rule_based_signal_supertrend(indicators)
 
-    from config import RSI_OVERSOLD as _RSI_OS_GLOBAL, RSI_OVERBOUGHT as _RSI_OB_GLOBAL
+    from config import (
+        RSI_OVERSOLD as _RSI_OS_GLOBAL,
+        RSI_OVERBOUGHT as _RSI_OB_GLOBAL,
+        MIN_ENTRY_QUALITY as _MIN_ENTRY_QUALITY,
+    )
 
     try:
         price    = float(indicators.get("price",    0))
@@ -279,6 +283,12 @@ def _rule_based_signal(indicators: dict) -> dict:
         kc_upper = float(indicators.get("kc_upper", 0))
         ma_trend = float(indicators.get("ma_trend", 0))
         hurst    = float(indicators.get("hurst",    0.5))
+        atr      = float(indicators.get("atr",      0))
+        trend_slope = float(indicators.get("trend_slope", 0.0))
+        regime_gate = indicators.get("regime_gate", "neutral")
+        entry_quality = float(indicators.get("entry_quality", 0.0))
+        entry_quality_side = indicators.get("entry_quality_side", "neutral")
+        entry_quality_min = float(indicators.get("entry_quality_min", max(_MIN_ENTRY_QUALITY, 0.25)))
         rsi_os   = float(indicators.get("rsi_oversold",  _RSI_OS_GLOBAL))
         rsi_ob   = float(indicators.get("rsi_overbought", _RSI_OB_GLOBAL))
 
@@ -304,6 +314,11 @@ def _rule_based_signal(indicators: dict) -> dict:
                     "reason": f"rules: trending regime (H={hurst:.2f}≥{HURST_MR_MAX}) — skip mean-reversion",
                     "source": "rules"}
 
+        if regime_gate != "mean_reversion":
+            return {"action": "hold", "confidence": 0.0,
+                    "reason": f"rules: regime {regime_gate} — prefer hold over forcing a KC fade",
+                    "source": "rules"}
+
         # ── Direction gate: MA trend filter ───────────────────────────────────
         # In moderate trends (ADX ≤ ADX_MR_MAX), only trade WITH the trend.
         # Longs require price > EMA50; shorts require price < EMA50.
@@ -311,24 +326,55 @@ def _rule_based_signal(indicators: dict) -> dict:
         below_trend = price < ma_trend
         ma_filter   = indicators.get("ma_trend_filter", True)
 
-        long_ok  = (not ma_filter) or above_trend
-        short_ok = (not ma_filter) or below_trend
+        slope_ok_long = trend_slope >= 0
+        slope_ok_short = trend_slope <= 0
+        long_ok  = ((not ma_filter) or above_trend) and slope_ok_long
+        short_ok = ((not ma_filter) or below_trend) and slope_ok_short
+
+        # ── Entry quality gate: require meaningful penetration beyond the KC band ──
+        # ATR-normalized penetration avoids treating a light touch like a true stretch.
+        long_quality_ok = (
+            price < kc_lower and
+            entry_quality_side in ("long", "neutral") and
+            entry_quality >= entry_quality_min
+        )
+        short_quality_ok = (
+            price > kc_upper and
+            entry_quality_side in ("short", "neutral") and
+            entry_quality >= entry_quality_min
+        )
 
         # ── Signal ────────────────────────────────────────────────────────────
-        if price < kc_lower and rsi < rsi_os and long_ok:
+        if price < kc_lower and rsi < rsi_os and long_ok and long_quality_ok:
             trend_note = "above MA_TREND" if above_trend else "MA_TREND filter OFF"
             return {"action": "long", "confidence": 0.75,
-                    "reason": f"rules: below KC lower, RSI {rsi:.1f} < {rsi_os}, {trend_note}",
+                    "reason": (
+                        f"rules: below KC lower, RSI {rsi:.1f} < {rsi_os}, "
+                        f"{trend_note}, slope={trend_slope:+.4f}, entryQ={entry_quality:.2f} ATR"
+                    ),
                     "source": "rules"}
 
-        if price > kc_upper and rsi > rsi_ob and short_ok:
+        if price > kc_upper and rsi > rsi_ob and short_ok and short_quality_ok:
             trend_note = "below MA_TREND" if below_trend else "MA_TREND filter OFF"
             return {"action": "short", "confidence": 0.75,
-                    "reason": f"rules: above KC upper, RSI {rsi:.1f} > {rsi_ob}, {trend_note}",
+                    "reason": (
+                        f"rules: above KC upper, RSI {rsi:.1f} > {rsi_ob}, "
+                        f"{trend_note}, slope={trend_slope:+.4f}, entryQ={entry_quality:.2f} ATR"
+                    ),
+                    "source": "rules"}
+
+        if (price < kc_lower and rsi < rsi_os and not long_quality_ok) or (
+            price > kc_upper and rsi > rsi_ob and not short_quality_ok
+        ):
+            return {"action": "hold", "confidence": 0.0,
+                    "reason": (
+                        f"rules: KC penetration too shallow "
+                        f"(entryQ={entry_quality:.2f} ATR < {entry_quality_min:.2f}, atr={atr:.4f})"
+                    ),
                     "source": "rules"}
 
         return {"action": "hold", "confidence": 0.0,
-                "reason": "rules: no signal — price inside channel or direction filter active",
+                "reason": "rules: no signal — price inside channel or direction/slope filter active",
                 "source": "rules"}
 
     except Exception as e:

@@ -11,9 +11,47 @@ from hltrading.shared.metrics import aggregate_coin_pnl, build_equity_series
 def load_dashboard_state() -> dict:
     try:
         from risk_manager import load_state
-        return load_state()
+        state = load_state()
     except Exception:
         return {}
+    try:
+        from config import HL_ENABLED
+
+        if not HL_ENABLED:
+            return state
+
+        from hltrading.execution.account_service import get_hl_account_info
+
+        hl_account = get_hl_account_info()
+        if not hl_account:
+            return state
+
+        account_value = hl_account.get("account_value")
+        if account_value is not None:
+            state["capital"] = float(account_value)
+
+        live_positions = {}
+        for position_wrapper in hl_account.get("positions", []):
+            pos = position_wrapper.get("position", {})
+            coin = pos.get("coin")
+            if not coin:
+                continue
+            size = float(pos.get("szi", 0) or 0)
+            if size == 0:
+                continue
+            live_positions[coin] = {
+                "entry_price": float(pos.get("entryPx", 0) or 0),
+                "stop_loss": None,
+                "take_profit": None,
+                "size_units": abs(size),
+                "side": "long" if size > 0 else "short",
+                "opened_at": "",
+            }
+        if live_positions:
+            state["positions"] = live_positions
+    except Exception:
+        pass
+    return state
 
 
 def load_dashboard_trades() -> list:
@@ -160,12 +198,14 @@ def positions_html(positions: dict, live_prices: dict) -> str:
     rows = []
     for coin, pos in positions.items():
         entry = float(pos.get("entry_price", 0))
-        sl = float(pos.get("stop_loss", 0))
-        tp = float(pos.get("take_profit", 0))
+        sl = pos.get("stop_loss")
+        tp = pos.get("take_profit")
         size_units = float(pos.get("size_units", 0))
         side = pos.get("side", "?")
         opened = str(pos.get("opened_at", ""))[:16]
         entry_usd = entry * size_units
+        sl_str = f"${float(sl):,.4f}" if sl not in (None, "") else "—"
+        tp_str = f"${float(tp):,.4f}" if tp not in (None, "") else "—"
         live_price = live_prices.get(coin)
         if live_price:
             unreal = ((live_price - entry) if side == "long" else (entry - live_price)) * size_units
@@ -181,8 +221,8 @@ def positions_html(positions: dict, live_prices: dict) -> str:
             f"<td>${entry_usd:,.2f}</td>"
             f"<td>{live_price_str}</td>"
             f"<td>{unreal_str}</td>"
-            f"<td>${sl:,.4f}</td>"
-            f"<td>${tp:,.4f}</td>"
+            f"<td>{sl_str}</td>"
+            f"<td>{tp_str}</td>"
             f"<td>{opened}</td></tr>"
         )
     return (

@@ -19,7 +19,7 @@ class TestWebServerRoutes(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.mimetype, "text/html")
         body = response.get_data(as_text=True)
-        self.assertIn("ArbyBot Control", body)
+        self.assertIn("HLTrading Dashboard", body)
         self.assertIn("Equity Curve", body)
         self.assertIn("/api/status", body)
 

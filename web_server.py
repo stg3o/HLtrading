@@ -184,7 +184,10 @@ def api_trades():
 
 @app.route("/api/coins")
 def api_coins():
-    return jsonify(build_coins_payload(_risk))
+    from config import HL_ENABLED
+
+    hl_account = _hl_account_cached() if HL_ENABLED else {}
+    return jsonify(build_coins_payload(_risk, hl_account=hl_account))
 
 
 @app.route("/api/log")
