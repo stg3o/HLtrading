@@ -9,8 +9,11 @@ from core.lifecycle import start_bot_lifecycle, stop_bot_lifecycle
 
 
 class TestLifecycle(unittest.TestCase):
-    def test_start_bot_lifecycle_starts_controller_sets_event_and_threads(self):
+    def test_start_bot_lifecycle_sets_event_and_threads(self):
         bot_running = threading.Event()
+        stop_event = threading.Event()
+        validate_coin_config = Mock(return_value=[])
+        validate_symbols = Mock(return_value={"active": [("BTC", "BTC", 3)], "disabled": [], "merged": []})
         sync_positions = Mock()
         printer = Mock()
         call_order = []
@@ -21,21 +24,15 @@ class TestLifecycle(unittest.TestCase):
         def monitor_loop():
             call_order.append("monitor_loop")
 
-        controller = Mock()
-
-        def controller_factory(**kwargs):
-            call_order.append(("factory", kwargs))
-            return controller
-
         fore = types.SimpleNamespace(CYAN="", GREEN="", YELLOW="")
 
-        bot_thread, monitor_thread, tg_controller = start_bot_lifecycle(
+        bot_thread, monitor_thread, init_status = start_bot_lifecycle(
             bot_running=bot_running,
+            stop_event=stop_event,
+            validate_coin_config=validate_coin_config,
+            validate_symbols=validate_symbols,
             sync_positions=sync_positions,
-            telegram_controller_factory=controller_factory,
             risk_manager="risk",
-            close_fn="close",
-            closeall_fn="closeall",
             bot_loop=bot_loop,
             monitor_loop=monitor_loop,
             printer=printer,
@@ -43,37 +40,31 @@ class TestLifecycle(unittest.TestCase):
         )
 
         self.assertTrue(bot_running.is_set())
-        sync_positions.assert_called_once_with()
-        controller.start.assert_called_once_with()
-        self.assertIs(tg_controller, controller)
+        self.assertFalse(stop_event.is_set())
+        sync_positions.assert_called_once_with(quiet=True)
         self.assertIsInstance(bot_thread, threading.Thread)
         self.assertIsInstance(monitor_thread, threading.Thread)
+        self.assertTrue(init_status["sync_ok"])
         bot_thread.join(timeout=1)
         monitor_thread.join(timeout=1)
-        self.assertEqual(call_order[0][0], "factory")
-        self.assertEqual(call_order[1:], ["bot_loop", "monitor_loop"])
-        self.assertEqual(
-            printer.call_args_list,
-            [
-                unittest.mock.call("  Syncing local state with HL positions…"),
-                unittest.mock.call("  SL/TP monitor started (checks every 2 min)."),
-            ],
-        )
+        self.assertEqual(call_order, ["bot_loop", "monitor_loop"])
+        printer.assert_not_called()
 
     def test_start_bot_lifecycle_noops_when_already_running(self):
         bot_running = threading.Event()
         bot_running.set()
+        stop_event = threading.Event()
         sync_positions = Mock()
         printer = Mock()
         fore = types.SimpleNamespace(CYAN="", GREEN="", YELLOW="")
 
         result = start_bot_lifecycle(
             bot_running=bot_running,
+            stop_event=stop_event,
+            validate_coin_config=Mock(),
+            validate_symbols=Mock(),
             sync_positions=sync_positions,
-            telegram_controller_factory=Mock(),
             risk_manager=None,
-            close_fn=None,
-            closeall_fn=None,
             bot_loop=Mock(),
             monitor_loop=Mock(),
             printer=printer,
@@ -84,39 +75,39 @@ class TestLifecycle(unittest.TestCase):
         sync_positions.assert_not_called()
         printer.assert_called_once_with("  Bot is already running.")
 
-    def test_stop_bot_lifecycle_clears_event_and_stops_controller(self):
+    def test_stop_bot_lifecycle_clears_event(self):
         bot_running = threading.Event()
         bot_running.set()
-        controller = Mock()
+        stop_event = threading.Event()
         printer = Mock()
         fore = types.SimpleNamespace(CYAN="", GREEN="", YELLOW="")
 
-        result = stop_bot_lifecycle(
+        stop_bot_lifecycle(
             bot_running=bot_running,
-            tg_controller=controller,
+            stop_event=stop_event,
+            bot_thread=None,
+            monitor_thread=None,
             printer=printer,
             fore=fore,
         )
 
         self.assertFalse(bot_running.is_set())
-        controller.stop.assert_called_once_with()
-        self.assertIsNone(result)
+        self.assertTrue(stop_event.is_set())
         printer.assert_called_once_with("  Stopping bot… (finishes current scan)")
 
     def test_stop_bot_lifecycle_noops_when_not_running(self):
         bot_running = threading.Event()
-        controller = Mock()
+        stop_event = threading.Event()
         printer = Mock()
         fore = types.SimpleNamespace(CYAN="", GREEN="", YELLOW="")
 
-        result = stop_bot_lifecycle(
+        stop_bot_lifecycle(
             bot_running=bot_running,
-            tg_controller=controller,
+            stop_event=stop_event,
+            bot_thread=None,
+            monitor_thread=None,
             printer=printer,
             fore=fore,
         )
 
-        controller.stop.assert_not_called()
-        self.assertIs(result, controller)
         printer.assert_called_once_with("  Bot is not running.")
-

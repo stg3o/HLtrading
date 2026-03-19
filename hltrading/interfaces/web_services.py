@@ -192,6 +192,7 @@ def build_recent_trades_payload(n: int = 50) -> list:
 def build_status_payload(*, risk, bot_running, paused: bool, hl_account: dict, last_updated: str) -> dict:
     from config import PAPER_CAPITAL, TESTNET, HL_ENABLED
 
+    hl_account = hl_account or {}
     hl_balance = hl_account.get("account_value")
     hl_perps = hl_account.get("perps_equity")
     hl_spot = hl_account.get("spot_usdc")

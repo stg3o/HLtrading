@@ -4,12 +4,14 @@ This module is the last line of defence before any trade executes.
 AI recommendations are overridden here if they violate risk rules.
 """
 import json
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from colorama import Fore, Style
 from config import (
     RISK_PER_TRADE, STOP_LOSS_PCT, TAKE_PROFIT_PCT,
     MAX_OPEN_POSITIONS, MAX_POSITIONS_SIDE, MAX_DAILY_LOSS, MAX_DRAWDOWN,
-    STATE_FILE, AI_CONFIDENCE_THRESHOLD, KELLY_FRACTION, HL_FEE_RATE
+    STATE_FILE, AI_CONFIDENCE_THRESHOLD, KELLY_FRACTION, HL_FEE_RATE,
+    HL_MAX_POSITION_USD, DISABLED_COINS_FILE, TRADE_COOLDOWN_MINUTES,
+    ENFORCE_LOSS_LIMIT_IN_PAPER,
 )
 from shared.state import load_state as _load_json_state, save_state as _save_json_state
 
@@ -40,7 +42,53 @@ def _default_state() -> dict:
         "losses":         0,
         "emergency_stop": False,
         "trading_halted": False,
+        "mode":           "paper",
+        "paper_loss_limit_warning_date": None,
+        "coin_cooldowns": {},
     }
+
+
+def _append_disabled_coins(coins: list[str]) -> None:
+    """Append coin names to DISABLED_COINS_FILE (union — never removes entries)."""
+    existing: list[str] = []
+    try:
+        if DISABLED_COINS_FILE.exists():
+            existing = json.loads(DISABLED_COINS_FILE.read_text())
+    except Exception:
+        pass
+    merged = sorted(set(existing) | set(coins))
+    try:
+        DISABLED_COINS_FILE.write_text(json.dumps(merged, indent=2))
+    except Exception as exc:
+        print(Fore.YELLOW + f"  [WARNING] Could not write {DISABLED_COINS_FILE}: {exc}")
+
+
+def reload_disabled_coins() -> list[str]:
+    """
+    Read DISABLED_COINS_FILE and set enabled=False for any listed coin in COINS.
+    Call once at startup (before the bot loop) so circuit-breaker state from a
+    previous run is honoured without requiring a manual config edit.
+    Returns the list of coin names re-applied as disabled.
+    """
+    from config import COINS
+    if not DISABLED_COINS_FILE.exists():
+        return []
+    try:
+        disabled = json.loads(DISABLED_COINS_FILE.read_text())
+    except Exception:
+        return []
+    applied: list[str] = []
+    for coin in disabled:
+        if coin in COINS and COINS[coin].get("enabled", True):
+            COINS[coin]["enabled"] = False
+            applied.append(coin)
+    if applied:
+        print(
+            Fore.YELLOW +
+            f"  [CIRCUIT BREAKER] Restoring disabled coins from previous run: {', '.join(applied)}" +
+            Style.RESET_ALL
+        )
+    return applied
 
 
 class RiskManager:
@@ -55,7 +103,18 @@ class RiskManager:
             self.state["daily_start"]     = self.state["capital"]
             self.state["last_reset_date"] = today
             self.state["trading_halted"]  = False
+            self.state["paper_loss_limit_warning_date"] = None
             save_state(self.state)
+
+    def set_mode(self, mode: str) -> None:
+        normalized = "live" if str(mode).strip().lower() == "live" else "paper"
+        self.state["mode"] = normalized
+        if normalized == "paper" and not ENFORCE_LOSS_LIMIT_IN_PAPER:
+            self.state["trading_halted"] = False
+        save_state(self.state)
+
+    def _enforce_daily_loss_limit(self) -> bool:
+        return self.state.get("mode", "paper") == "live" or ENFORCE_LOSS_LIMIT_IN_PAPER
 
     # ── CHECKS ────────────────────────────────────────────────────────────────
 
@@ -64,8 +123,11 @@ class RiskManager:
         if self.state.get("emergency_stop"):
             return True, "EMERGENCY STOP is active"
 
-        if self.state.get("trading_halted"):
+        if self.state.get("trading_halted") and self._enforce_daily_loss_limit():
             return True, "Daily loss limit reached — trading halted until tomorrow"
+        if self.state.get("trading_halted") and not self._enforce_daily_loss_limit():
+            self.state["trading_halted"] = False
+            save_state(self.state)
 
         # Check drawdown from equity peak
         drawdown = (self.state["equity_peak"] - self.state["capital"]) / self.state["equity_peak"]
@@ -77,9 +139,20 @@ class RiskManager:
         # Check daily loss
         daily_loss = (self.state["daily_start"] - self.state["capital"]) / self.state["daily_start"]
         if daily_loss >= MAX_DAILY_LOSS:
-            self.state["trading_halted"] = True
-            save_state(self.state)
-            return True, f"Daily loss limit {MAX_DAILY_LOSS*100:.0f}% reached ({daily_loss*100:.1f}%) — halting for today"
+            if self._enforce_daily_loss_limit():
+                self.state["trading_halted"] = True
+                save_state(self.state)
+                return True, f"Daily loss limit {MAX_DAILY_LOSS*100:.0f}% reached ({daily_loss*100:.1f}%) — halting for today"
+            today = str(date.today())
+            if self.state.get("paper_loss_limit_warning_date") != today:
+                self.state["paper_loss_limit_warning_date"] = today
+                save_state(self.state)
+                print(
+                    Fore.YELLOW +
+                    f"  [RISK] Daily loss limit exceeded ({daily_loss*100:.1f}%) "
+                    f"(paper mode — not enforced)" +
+                    Style.RESET_ALL
+                )
 
         return False, ""
 
@@ -102,6 +175,17 @@ class RiskManager:
             if existing_hl == requested_hl:
                 return False, f"Already have an open position in {requested_hl} ({existing_coin})"
 
+        cooldown_until = (self.state.get("coin_cooldowns") or {}).get(coin)
+        if cooldown_until:
+            try:
+                until_dt = datetime.fromisoformat(cooldown_until)
+                now = datetime.now()
+                if now < until_dt:
+                    mins_left = max(1, int((until_dt - now).total_seconds() // 60))
+                    return False, f"{coin} cooldown active for {mins_left} more minute(s)"
+            except Exception:
+                pass
+
         if len(self.state["positions"]) >= MAX_OPEN_POSITIONS:
             return False, f"Max open positions ({MAX_OPEN_POSITIONS}) reached"
 
@@ -114,7 +198,58 @@ class RiskManager:
             if same_side >= MAX_POSITIONS_SIDE:
                 return False, f"Max {side} positions ({MAX_POSITIONS_SIDE}) reached — correlated exposure cap"
 
+        # Rolling correlation gate: block entry if candidate is >0.7 correlated with
+        # any already-open position over the last 20 bars of their common price series.
+        # This catches correlated alts that the per-side cap misses (e.g. ADA long while
+        # AVAX long is already open — both alt-cycle coins, not BTC/ETH/SOL).
+        corr_block, corr_reason = self._correlation_gate(coin, _COINS)
+        if corr_block:
+            return False, corr_reason
+
         return True, ""
+
+    _CORRELATION_THRESHOLD = 0.70   # block if 20-bar return correlation exceeds this
+    _CORRELATION_LOOKBACK  = 20     # bars used for rolling correlation check
+
+    def _correlation_gate(self, candidate: str, coins_cfg: dict) -> tuple[bool, str]:
+        """Return (blocked, reason) if candidate correlates > threshold with any open position."""
+        if not self.state["positions"]:
+            return False, ""
+        try:
+            from strategy import _DATA_CACHE
+            import numpy as np
+            cand_cfg = coins_cfg.get(candidate, {})
+            cand_key = (cand_cfg.get("ticker", candidate), cand_cfg.get("interval", "5m"), cand_cfg.get("period", "60d"))
+            cand_entry = _DATA_CACHE.get(cand_key)
+            if cand_entry is None:
+                return False, ""   # no data yet — don't block
+            cand_close = cand_entry["df"]["Close"].values[-self._CORRELATION_LOOKBACK:]
+            if len(cand_close) < self._CORRELATION_LOOKBACK:
+                return False, ""
+            cand_returns = np.diff(cand_close) / cand_close[:-1]
+
+            for held_coin in self.state["positions"]:
+                held_cfg = coins_cfg.get(held_coin, {})
+                held_key = (held_cfg.get("ticker", held_coin), held_cfg.get("interval", "5m"), held_cfg.get("period", "60d"))
+                held_entry = _DATA_CACHE.get(held_key)
+                if held_entry is None:
+                    continue
+                held_close = held_entry["df"]["Close"].values[-self._CORRELATION_LOOKBACK:]
+                if len(held_close) < self._CORRELATION_LOOKBACK:
+                    continue
+                held_returns = np.diff(held_close) / held_close[:-1]
+                n = min(len(cand_returns), len(held_returns))
+                if n < 5:
+                    continue
+                corr = float(np.corrcoef(cand_returns[-n:], held_returns[-n:])[0, 1])
+                if corr > self._CORRELATION_THRESHOLD:
+                    return True, (
+                        f"{candidate} blocked — {corr:.2f} correlation with open {held_coin} "
+                        f"(threshold {self._CORRELATION_THRESHOLD})"
+                    )
+        except Exception:
+            return False, ""   # never block on calculation error
+        return False, ""
 
     # ── POSITION SIZING ───────────────────────────────────────────────────────
 
@@ -193,6 +328,12 @@ class RiskManager:
                 kelly_mult = 0.5   # negative edge — shrink to minimum
 
         size_usd   = size_usd * vol_scalar * corr_scalar * kelly_mult
+        # Apply the hard notional cap before computing units or reporting risk_amount.
+        # Without this, risk_amount = capital × RISK_PER_TRADE = $20 while the cap
+        # brings actual notional to $200, making the risk figure in the returned dict
+        # a fiction. Capping here keeps risk_amount honest: actual_risk = size_usd × sl_pct.
+        size_usd   = min(size_usd, HL_MAX_POSITION_USD)
+        risk_amount = size_usd * sl_pct   # actual USD at risk after cap
         size_units = size_usd / price
 
         # Use explicit TP price if provided (e.g. KC midline); else fixed %.
@@ -218,7 +359,8 @@ class RiskManager:
 
     # ── POSITION LIFECYCLE ────────────────────────────────────────────────────
 
-    def open_position(self, coin: str, side: str, price: float, sizing: dict) -> None:
+    def open_position(self, coin: str, side: str, price: float, sizing: dict,
+                      entry_tags: dict | None = None) -> None:
         _sl_pct   = sizing.get("sl_pct",   STOP_LOSS_PCT)
         _tp_pct   = sizing.get("tp_pct",   TAKE_PROFIT_PCT)
         _tp_price = sizing.get("tp_price")  # explicit KC-midline TP if set
@@ -253,6 +395,8 @@ class RiskManager:
             "take_profit":    tp,
             "opened_at":      str(datetime.now()),
             "ai_confidence":  sizing.get("ai_confidence"),   # stored for Brier Score
+            "cascade_assisted": bool((entry_tags or {}).get("cascade_assisted", False)),
+            "entry_context":  (entry_tags or {}).get("entry_context", "normal"),
         }
         save_state(self.state)
 
@@ -281,7 +425,13 @@ class RiskManager:
         else:
             self.state["losses"]  += 1
 
+        if TRADE_COOLDOWN_MINUTES > 0:
+            self.state.setdefault("coin_cooldowns", {})[coin] = (
+                datetime.now() + timedelta(minutes=TRADE_COOLDOWN_MINUTES)
+            ).isoformat()
+
         save_state(self.state)
+        self.check_probationary_coins()
 
         return {
             "coin":        coin,
@@ -293,6 +443,58 @@ class RiskManager:
             "pnl":         round(pnl, 2),           # net P&L after fees
             "pnl_pct":     round(pnl / pos["size_usd"] * 100, 2),
         }
+
+    # ── PROBATIONARY CIRCUIT BREAKER ─────────────────────────────────────────
+    # Coins marked "probationary": True in COINS config are auto-disabled at
+    # runtime if their rolling profit factor falls below the minimum threshold
+    # after the required minimum number of live trades.
+    # This replaces the manual "watch closely" instruction in the config comments.
+    _PROBATIONARY_MIN_TRADES = 30
+    _PROBATIONARY_MIN_PF     = 1.1
+
+    def check_probationary_coins(self) -> list[str]:
+        """
+        Evaluate rolling PF for every probationary coin. Auto-disables any coin
+        whose live PF falls below _PROBATIONARY_MIN_PF after _PROBATIONARY_MIN_TRADES.
+
+        Persists the disabled-coin list to DISABLED_COINS_FILE so the circuit
+        breaker survives process restarts (reload_disabled_coins() applies it).
+
+        Returns a list of coin names that were disabled this call (empty if none).
+        Call this after each close_position() so the check runs automatically.
+        """
+        from config import COINS
+        try:
+            from hltrading.execution.trade_log import load_trades
+            all_trades = load_trades()
+        except Exception:
+            return []
+
+        disabled: list[str] = []
+        for coin, cfg in COINS.items():
+            if not cfg.get("probationary") or not cfg.get("enabled", False):
+                continue
+            coin_trades = [t for t in all_trades if t.get("coin") == coin]
+            if len(coin_trades) < self._PROBATIONARY_MIN_TRADES:
+                continue
+            recent = coin_trades[-self._PROBATIONARY_MIN_TRADES:]
+            gross_wins   = sum(float(t["pnl"]) for t in recent if float(t["pnl"]) > 0)
+            gross_losses = sum(abs(float(t["pnl"])) for t in recent if float(t["pnl"]) <= 0)
+            pf = gross_wins / gross_losses if gross_losses > 1e-8 else float("inf")
+            if pf < self._PROBATIONARY_MIN_PF:
+                cfg["enabled"] = False
+                disabled.append(coin)
+                print(
+                    Fore.RED +
+                    f"  [CIRCUIT BREAKER] {coin} disabled — live PF {pf:.2f} < {self._PROBATIONARY_MIN_PF} "
+                    f"over last {self._PROBATIONARY_MIN_TRADES} trades." +
+                    Style.RESET_ALL
+                )
+
+        if disabled:
+            _append_disabled_coins(disabled)
+
+        return disabled
 
     def trigger_emergency_stop(self) -> None:
         self.state["emergency_stop"] = True

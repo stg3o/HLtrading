@@ -10,10 +10,25 @@ import time
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
-import yfinance as yf
 import logging
 from colorama import Fore, Style
-from config import KC_PERIOD, KC_SCALAR, MA_FAST, MA_SLOW, MA_TREND, RSI_PERIOD, RSI_OVERSOLD, RSI_OVERBOUGHT
+from hltrading.shared.hyperliquid_candles import (
+    bars_for_lookback,
+    get_hl_candles as get_hl_candles_df,
+    resolve_asset_id,
+)
+from config import (
+    COINS,
+    KC_PERIOD, KC_SCALAR, MA_FAST, MA_SLOW, MA_TREND, RSI_PERIOD, RSI_OVERSOLD, RSI_OVERBOUGHT,
+    HURST_MR_MAX, MTF_TIMEFRAME_DEFAULTS, STRATEGY_ALLOWED_REGIMES,
+    REGIME_TREND_ADX_MIN, REGIME_RANGE_ADX_MAX, REGIME_HIGH_VOL_ATR_PCT,
+    REGIME_VOL_EXPANSION_BANDWIDTH, EXTREME_VOL_ATR_PCT,
+    FUNDING_EXTREME_ABS, FUNDING_HARD_BLOCK_ABS, OI_MIN_PCT_CHANGE,
+    BTC_FILTER_INTERVAL, BTC_FILTER_PERIOD, BTC_FILTER_TREND_ADX,
+    BTC_FILTER_EXTREME_VOL_ATR_PCT,
+    CASCADE_VOLUME_SPIKE_MIN, CASCADE_RANGE_ATR_MIN, CASCADE_BREAKOUT_LOOKBACK,
+    CASCADE_BREAKOUT_ATR_BUFFER, CASCADE_EXTREME_VOLUME_SPIKE, CASCADE_EXTREME_RANGE_ATR,
+)
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -21,6 +36,9 @@ logger = logging.getLogger(__name__)
 _DATA_CACHE: dict[tuple[str, str, str], dict] = {}
 _INDICATOR_CACHE: dict[tuple, dict] = {}
 _TREND_BIAS_CACHE: dict[tuple, dict] = {}
+_TF_CONTEXT_CACHE: dict[tuple, dict] = {}
+_DERIVATIVES_SNAPSHOT_CACHE: dict[str, dict] = {}
+_BTC_FILTER_CACHE: dict[tuple, dict] = {}
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -122,7 +140,11 @@ def _momentum_score(close: pd.Series, volume: pd.Series | None = None) -> float:
         score = 0.4 * mom_5d + 0.3 * mom_15d + 0.3 * mom_30d
 
         if volume is not None and len(volume) > 21:
-            vol_ratio = _safe(volume.iloc[-1] / volume.rolling(21).mean().iloc[-1], 1.0)
+            avg_vol = _safe(volume.rolling(21).mean().iloc[-1], 0.0)
+            if np.isfinite(avg_vol) and avg_vol > 0:
+                vol_ratio = _safe(volume.iloc[-1] / avg_vol, 1.0)
+            else:
+                vol_ratio = 1.0
             vol_ratio = min(max(vol_ratio, 0.5), 2.0)
             volume_boost = math.sqrt(vol_ratio)
             score *= volume_boost
@@ -225,6 +247,419 @@ def _data_signature(df: pd.DataFrame) -> tuple:
         _round_price(_safe(row["Close"])),
         round(_safe(row.get("Volume", 0.0)), 4),
     )
+
+
+def _default_period_for_interval(interval: str) -> str:
+    if interval.endswith("m"):
+        minutes = int(interval[:-1])
+        if minutes <= 5:
+            return "60d"
+        if minutes <= 15:
+            return "90d"
+        return "180d"
+    if interval.endswith("h"):
+        hours = int(interval[:-1])
+        return "365d" if hours <= 4 else "730d"
+    if interval.endswith("d"):
+        return "730d"
+    return "180d"
+
+
+def _normalize_mtf_config(coin_cfg: dict) -> dict[str, dict[str, str]]:
+    configured = coin_cfg.get("timeframes", {}) or {}
+    entry_interval = configured.get("entry") or coin_cfg.get("interval", "5m")
+    entry_period = coin_cfg.get("period") or _default_period_for_interval(entry_interval)
+
+    result = {
+        "higher": dict(MTF_TIMEFRAME_DEFAULTS.get("higher", {})),
+        "mid": dict(MTF_TIMEFRAME_DEFAULTS.get("mid", {})),
+        "entry": dict(MTF_TIMEFRAME_DEFAULTS.get("entry", {})),
+    }
+    for key in ("higher", "mid"):
+        cfg_value = configured.get(key)
+        if isinstance(cfg_value, dict):
+            result[key].update({k: v for k, v in cfg_value.items() if v})
+        elif cfg_value:
+            result[key]["interval"] = cfg_value
+        result[key]["period"] = result[key].get("period") or _default_period_for_interval(result[key]["interval"])
+
+    entry_cfg = configured.get("entry")
+    if isinstance(entry_cfg, dict):
+        entry_interval = entry_cfg.get("interval") or entry_interval
+        entry_period = entry_cfg.get("period") or entry_period
+    elif entry_cfg:
+        entry_interval = entry_cfg
+    result["entry"] = {"interval": entry_interval, "period": entry_period}
+    return result
+
+
+def _resolve_allowed_regimes(coin_cfg: dict) -> tuple[str, ...]:
+    explicit = coin_cfg.get("allowed_regimes")
+    if explicit:
+        return tuple(explicit)
+    strategy_type = coin_cfg.get("strategy_type", "mean_reversion")
+    return tuple(STRATEGY_ALLOWED_REGIMES.get(strategy_type, ("trend", "range", "high_volatility")))
+
+
+def _indicator_trend_label(indicators: dict) -> str:
+    if indicators.get("strategy_type") == "supertrend":
+        direction = indicators.get("st_direction", 0)
+        return "bullish" if direction == 1 else "bearish" if direction == -1 else "neutral"
+    ma_alignment = indicators.get("ma_alignment")
+    if ma_alignment == "bullish":
+        return "bullish"
+    if ma_alignment == "bearish":
+        return "bearish"
+    trend_direction = indicators.get("trend_direction", "flat")
+    if trend_direction == "up":
+        return "bullish"
+    if trend_direction == "down":
+        return "bearish"
+    return "neutral"
+
+
+def _build_tf_snapshot(coin: str, coin_cfg: dict, tf_name: str, interval: str, period: str) -> dict:
+    cache_key = (coin, tf_name, interval, period)
+    df = get_market_data(
+        coin,
+        interval,
+        period,
+        asset_id=coin_cfg.get("asset_id"),
+        hl_symbol=coin_cfg.get("hl_symbol", coin),
+        warmup_bars=120,
+        scan_cache=coin_cfg.get("_scan_market_data_cache"),
+    )
+    if df is None or df.empty:
+        return {"interval": interval, "period": period, "trend": "neutral", "available": False}
+
+    signature = _data_signature(df)
+    cached = _TF_CONTEXT_CACHE.get(cache_key)
+    if cached and cached["signature"] == signature:
+        return dict(cached["snapshot"])
+
+    indicators = calculate_indicators(df)
+    if not indicators:
+        return {"interval": interval, "period": period, "trend": "neutral", "available": False}
+
+    snapshot = {
+        "interval": interval,
+        "period": period,
+        "trend": _indicator_trend_label(indicators),
+        "adx": indicators.get("adx", 0.0),
+        "ma_alignment": indicators.get("ma_alignment", "mixed"),
+        "trend_direction": indicators.get("trend_direction", "flat"),
+        "market_regime": indicators.get("market_regime", "neutral"),
+        "price": indicators.get("price", 0.0),
+        "ma_trend": indicators.get("ma_trend", 0.0),
+        "available": True,
+    }
+    _TF_CONTEXT_CACHE[cache_key] = {"signature": signature, "snapshot": dict(snapshot)}
+    return snapshot
+
+
+def _build_multi_timeframe_context(coin: str, coin_cfg: dict, market_data_cache: dict | None = None) -> dict:
+    if market_data_cache is not None and coin_cfg.get("_scan_market_data_cache") is not market_data_cache:
+        coin_cfg = dict(coin_cfg)
+        coin_cfg["_scan_market_data_cache"] = market_data_cache
+    tf_cfg = _normalize_mtf_config(coin_cfg)
+    higher = _build_tf_snapshot(coin, coin_cfg, "higher", tf_cfg["higher"]["interval"], tf_cfg["higher"]["period"])
+    mid = _build_tf_snapshot(coin, coin_cfg, "mid", tf_cfg["mid"]["interval"], tf_cfg["mid"]["period"])
+    higher_trend = higher.get("trend", "neutral")
+    mid_trend = mid.get("trend", "neutral")
+    aligned = higher_trend != "neutral" and higher_trend == mid_trend
+    direction = higher_trend if aligned else mid_trend if mid_trend != "neutral" else higher_trend
+    return {
+        "higher": higher,
+        "mid": mid,
+        "entry": tf_cfg["entry"],
+        "direction": direction if direction in ("bullish", "bearish") else "neutral",
+        "aligned": aligned,
+    }
+
+
+def _classify_trading_regime(indicators: dict, mtf_context: dict | None = None) -> str:
+    adx = float(indicators.get("adx", 0.0))
+    atr = float(indicators.get("atr", 0.0))
+    price = max(float(indicators.get("price", 0.0)), 1e-8)
+    vol_regime = indicators.get("vol_regime", "normal")
+    atr_pct = atr / price
+    band_width_pct = float(indicators.get("band_width_pct", 0.0))
+    mtf_direction = (mtf_context or {}).get("direction", "neutral")
+    mtf_aligned = bool((mtf_context or {}).get("aligned", False))
+
+    if (vol_regime == "high" and atr_pct >= REGIME_HIGH_VOL_ATR_PCT) or band_width_pct >= REGIME_VOL_EXPANSION_BANDWIDTH:
+        return "volatility_expansion"
+    if adx >= REGIME_TREND_ADX_MIN and mtf_direction in ("bullish", "bearish"):
+        return "trend"
+    if adx <= REGIME_RANGE_ADX_MAX and float(indicators.get("hurst", 0.5)) <= HURST_MR_MAX:
+        return "range"
+    if mtf_aligned and mtf_direction in ("bullish", "bearish"):
+        return "trend"
+    return "volatility_expansion" if vol_regime == "high" else "range"
+
+
+def strategy_matches_regime(coin_cfg: dict, regime: str) -> bool:
+    return regime in _resolve_allowed_regimes(coin_cfg)
+
+
+def _build_btc_market_filter_snapshot(
+    btc_cfg: dict | None = None,
+    market_data_cache: dict | None = None,
+) -> dict:
+    """Return a compact BTC market-state snapshot for altcoin gating."""
+    btc_cfg = dict(btc_cfg or get_coin_config("BTC") or {})
+    btc_cfg.setdefault("hl_symbol", "BTC")
+    btc_cfg["interval"] = BTC_FILTER_INTERVAL
+    btc_cfg["period"] = BTC_FILTER_PERIOD
+    if not isinstance(btc_cfg.get("asset_id"), int):
+        btc_cfg["asset_id"] = resolve_asset_id(btc_cfg["hl_symbol"])
+    logger.debug(
+        "BTC filter cfg: %s",
+        {
+            "hl_symbol": btc_cfg.get("hl_symbol"),
+            "asset_id": btc_cfg.get("asset_id"),
+            "interval": btc_cfg.get("interval"),
+            "period": btc_cfg.get("period"),
+            "timeframes": btc_cfg.get("timeframes"),
+        },
+    )
+    if not btc_cfg.get("hl_symbol") or not btc_cfg.get("interval") or not btc_cfg.get("period"):
+        return {
+            "available": False,
+            "risk_off": False,
+            "trend_spike": False,
+            "vol_spike": False,
+            "atr_pct": 0.0,
+            "adx": 0.0,
+            "regime": "unknown",
+        }
+    cache_key = ("BTC", BTC_FILTER_INTERVAL, BTC_FILTER_PERIOD)
+    df = get_market_data(
+        "BTC",
+        btc_cfg["interval"],
+        btc_cfg["period"],
+        asset_id=btc_cfg.get("asset_id"),
+        hl_symbol=btc_cfg["hl_symbol"],
+        warmup_bars=120,
+        scan_cache=market_data_cache,
+    )
+    if df is None or df.empty:
+        return {
+            "available": False,
+            "risk_off": False,
+            "trend_spike": False,
+            "vol_spike": False,
+            "atr_pct": 0.0,
+            "adx": 0.0,
+            "regime": "unknown",
+        }
+
+    signature = _data_signature(df)
+    cached = _BTC_FILTER_CACHE.get(cache_key)
+    if cached and cached["signature"] == signature:
+        return dict(cached["snapshot"])
+
+    indicators = calculate_indicators(df)
+    mtf_context = _build_multi_timeframe_context("BTC", btc_cfg, market_data_cache=market_data_cache)
+    regime = _classify_trading_regime(indicators or {}, mtf_context) if indicators else "unknown"
+    adx = float((indicators or {}).get("adx", 0.0))
+    atr_pct = float((indicators or {}).get("atr_pct", 0.0))
+    trend_spike = adx >= BTC_FILTER_TREND_ADX
+    vol_spike = atr_pct >= BTC_FILTER_EXTREME_VOL_ATR_PCT or regime == "volatility_expansion"
+    snapshot = {
+        "available": indicators is not None,
+        "risk_off": trend_spike or vol_spike,
+        "trend_spike": trend_spike,
+        "vol_spike": vol_spike,
+        "atr_pct": round(atr_pct, 4),
+        "adx": round(adx, 1),
+        "regime": regime,
+        "trend_direction": (indicators or {}).get("trend_direction", "flat"),
+    }
+    _BTC_FILTER_CACHE[cache_key] = {"signature": signature, "snapshot": dict(snapshot)}
+    return snapshot
+
+
+def get_btc_market_filter(btc_cfg: dict | None = None, market_data_cache: dict | None = None) -> dict:
+    return _build_btc_market_filter_snapshot(btc_cfg, market_data_cache=market_data_cache)
+
+
+def _detect_liquidation_cascade(
+    df: pd.DataFrame,
+    *,
+    price: float,
+    atr_value: float,
+    kc_upper: float | None = None,
+    kc_lower: float | None = None,
+) -> dict:
+    """Detect a likely forced-liquidation move using current OHLCV structure only."""
+    default = {
+        "cascade_event": False,
+        "cascade_direction": "neutral",
+        "cascade_volume_spike": 1.0,
+        "cascade_range_atr": 0.0,
+        "cascade_breakout": False,
+        "cascade_exhaustion": False,
+        "extreme_cascade": False,
+    }
+    try:
+        if len(df) < max(CASCADE_BREAKOUT_LOOKBACK + 2, 25) or atr_value <= 0:
+            return default
+
+        completed = df.iloc[:-1]
+        last_bar = completed.iloc[-1]
+        recent = completed.iloc[-(CASCADE_BREAKOUT_LOOKBACK + 1):-1]
+        if recent.empty:
+            return default
+
+        bar_open = _safe(last_bar.get("Open", price), price)
+        bar_close = _safe(last_bar.get("Close", price), price)
+        bar_high = _safe(last_bar.get("High", price), price)
+        bar_low = _safe(last_bar.get("Low", price), price)
+        bar_range = max(0.0, bar_high - bar_low)
+        candle_body = bar_close - bar_open
+
+        volume = completed.get("Volume")
+        vol_spike = 1.0
+        if volume is not None and len(volume) >= 21:
+            vol_ma = volume.rolling(20).mean().iloc[-2]
+            if vol_ma and vol_ma > 0:
+                vol_spike = _safe(volume.iloc[-1] / vol_ma, 1.0)
+
+        range_atr = bar_range / max(atr_value, 1e-8)
+        recent_high = _safe(recent["High"].max(), bar_high)
+        recent_low = _safe(recent["Low"].min(), bar_low)
+        breakout_up = bar_high >= recent_high + CASCADE_BREAKOUT_ATR_BUFFER * atr_value
+        breakout_down = bar_low <= recent_low - CASCADE_BREAKOUT_ATR_BUFFER * atr_value
+
+        direction = "neutral"
+        if breakout_up and candle_body >= 0:
+            direction = "up"
+        elif breakout_down and candle_body <= 0:
+            direction = "down"
+
+        cascade_event = (
+            vol_spike >= CASCADE_VOLUME_SPIKE_MIN and
+            range_atr >= CASCADE_RANGE_ATR_MIN and
+            direction in ("up", "down")
+        )
+
+        close_off_high = (bar_high - bar_close) / max(bar_range, 1e-8)
+        close_off_low = (bar_close - bar_low) / max(bar_range, 1e-8)
+        exhaustion = False
+        if cascade_event and direction == "up":
+            exhaustion = bool(kc_upper and price > kc_upper and close_off_high >= 0.35)
+        elif cascade_event and direction == "down":
+            exhaustion = bool(kc_lower and price < kc_lower and close_off_low >= 0.35)
+
+        extreme = (
+            cascade_event and
+            vol_spike >= CASCADE_EXTREME_VOLUME_SPIKE and
+            range_atr >= CASCADE_EXTREME_RANGE_ATR
+        )
+
+        return {
+            "cascade_event": cascade_event,
+            "cascade_direction": direction,
+            "cascade_volume_spike": round(vol_spike, 3),
+            "cascade_range_atr": round(range_atr, 3),
+            "cascade_breakout": breakout_up or breakout_down,
+            "cascade_exhaustion": exhaustion,
+            "extreme_cascade": extreme,
+        }
+    except Exception:
+        return default
+
+
+def select_strategy_candidates(candidates: list[tuple[str, dict, dict]]) -> list[tuple[str, dict, dict]]:
+    """Pick at most one candidate per underlying symbol, preferring regime-compatible setups."""
+    grouped: dict[str, list[tuple[str, dict, dict]]] = {}
+    for coin, cfg, indicators in candidates:
+        key = cfg.get("hl_symbol", coin)
+        grouped.setdefault(key, []).append((coin, cfg, indicators))
+
+    selected: list[tuple[str, dict, dict]] = []
+    for group in grouped.values():
+        compatible = [item for item in group if item[2].get("strategy_regime_match", False)]
+        if not compatible:
+            continue
+        pool = compatible
+        pool.sort(
+            key=lambda item: (
+                1 if item[2].get("strategy_regime_match", False) else 0,
+                item[2].get("allocator_score", 0.0),
+                item[2].get("entry_quality", 0.0),
+            ),
+            reverse=True,
+        )
+        selected.append(pool[0])
+    return selected
+
+
+def attach_derivatives_context(coin: str, indicators: dict,
+                               funding_rate: float | None = None,
+                               open_interest: float | None = None) -> dict:
+    """Add funding/OI context without forcing callers to manage state."""
+    price = float(indicators.get("price", 0.0))
+    snapshot = _DERIVATIVES_SNAPSHOT_CACHE.get(coin, {})
+    prev_price = float(snapshot.get("price", price))
+    prev_oi = snapshot.get("open_interest")
+    oi_delta_pct = 0.0
+    if open_interest is not None and prev_oi not in (None, 0):
+        oi_delta_pct = (float(open_interest) - float(prev_oi)) / abs(float(prev_oi))
+    price_delta_pct = 0.0
+    if prev_price:
+        price_delta_pct = (price - prev_price) / prev_price
+
+    oi_signal = "neutral"
+    if open_interest is not None and abs(oi_delta_pct) >= OI_MIN_PCT_CHANGE:
+        if price_delta_pct > 0 and oi_delta_pct > 0:
+            oi_signal = "trend_up_confirmed"
+        elif price_delta_pct < 0 and oi_delta_pct > 0:
+            oi_signal = "trend_down_confirmed"
+        elif price_delta_pct > 0 and oi_delta_pct < 0:
+            oi_signal = "short_covering"
+        elif price_delta_pct < 0 and oi_delta_pct < 0:
+            oi_signal = "long_liquidation"
+
+    funding_extreme = funding_rate is not None and abs(float(funding_rate)) >= FUNDING_EXTREME_ABS
+    funding_hard_block = funding_rate is not None and abs(float(funding_rate)) >= FUNDING_HARD_BLOCK_ABS
+    funding_bias = "neutral"
+    if funding_extreme:
+        funding_bias = "short" if float(funding_rate) > 0 else "long"
+
+    indicators["funding_rate"] = float(funding_rate) if funding_rate is not None else None
+    indicators["funding_extreme"] = funding_extreme
+    indicators["funding_hard_block"] = funding_hard_block
+    indicators["funding_bias"] = funding_bias
+    indicators["open_interest"] = float(open_interest) if open_interest is not None else None
+    indicators["oi_delta_pct"] = round(oi_delta_pct, 4)
+    indicators["price_delta_pct"] = round(price_delta_pct, 4)
+    indicators["oi_signal"] = oi_signal
+    indicators["trend_confirmation"] = (
+        "bullish" if oi_signal == "trend_up_confirmed" else
+        "bearish" if oi_signal == "trend_down_confirmed" else
+        "weakening"
+    )
+    indicators["trend_oi_confirmed"] = oi_signal in ("trend_up_confirmed", "trend_down_confirmed")
+    indicators["trend_oi_divergence"] = oi_signal in ("short_covering", "long_liquidation")
+    indicators["extreme_volatility"] = (
+        indicators.get("regime") == "volatility_expansion" and
+        float(indicators.get("atr_pct", 0.0)) >= EXTREME_VOL_ATR_PCT
+    )
+    indicators["allocator_score"] = round(
+        (0.4 if indicators.get("strategy_regime_match") else 0.0) +
+        (0.3 if indicators.get("mtf_alignment") else 0.0) +
+        (0.2 if oi_signal in ("trend_up_confirmed", "trend_down_confirmed") else 0.0) +
+        (0.1 if funding_extreme else 0.0),
+        4,
+    )
+
+    _DERIVATIVES_SNAPSHOT_CACHE[coin] = {
+        "price": price,
+        "open_interest": open_interest,
+    }
+    return indicators
 
 
 # ─── SUPERTREND ───────────────────────────────────────────────────────────────
@@ -335,6 +770,7 @@ def calculate_supertrend_indicators(df: pd.DataFrame,
         latest = {
             "price":           _round_price(price),
             "atr":             round(atr_val, 4),
+            "atr_pct":         round((atr_val / price) if price else 0.0, 4),
             "ma_trend":        round(_safe(ma_trend.iloc[-1]), 4),
             "adx":             round(adx_value, 1),
             "hurst":           round(hurst_val, 3),
@@ -352,6 +788,14 @@ def calculate_supertrend_indicators(df: pd.DataFrame,
             "st_flipped":      flipped,
         }
 
+        latest.update(
+            _detect_liquidation_cascade(
+                df,
+                price=price,
+                atr_value=atr_val,
+            )
+        )
+
         # Derived labels
         latest["trend_direction"] = "up"   if d_cur ==  1 else "down"
         latest["trend_strength"]  = ("strong"   if latest["adx"] > 25 else
@@ -368,30 +812,61 @@ def calculate_supertrend_indicators(df: pd.DataFrame,
 
 # ─── CORE INDICATOR CALCULATION ───────────────────────────────────────────────
 
-def download_data(ticker: str, interval: str, period: str) -> pd.DataFrame | None:
-    """Download OHLCV data from Yahoo Finance. Returns None on failure."""
-    cache_key = (ticker, interval, period)
-    cache_ttl = max(15, min(_interval_seconds(interval) // 2, 3600))
+def get_market_data(
+    coin: str,
+    timeframe: str,
+    lookback: str | int,
+    *,
+    asset_id: int | None = None,
+    hl_symbol: str | None = None,
+    warmup_bars: int = 0,
+    scan_cache: dict | None = None,
+) -> pd.DataFrame | None:
+    """Fetch Hyperliquid candles and normalize them for the indicator engine."""
+    symbol = str(hl_symbol or coin).strip().upper()
+    resolved_asset_id = asset_id if isinstance(asset_id, int) and asset_id >= 0 else resolve_asset_id(symbol)
+    limit = bars_for_lookback(timeframe, lookback, warmup_bars=warmup_bars)
+    scan_key = (resolved_asset_id, timeframe)
+    if scan_cache is not None and isinstance(resolved_asset_id, int) and resolved_asset_id >= 0:
+        cached_scan = scan_cache.get(scan_key)
+        if cached_scan and cached_scan.get("limit", 0) >= limit:
+            return cached_scan["df"].tail(limit).copy()
+    cache_key = (symbol, resolved_asset_id or -1, timeframe, str(lookback), warmup_bars)
+    cache_ttl = 0
     now = time.monotonic()
     cached = _DATA_CACHE.get(cache_key)
-    if cached and (now - cached["fetched_at"] < cache_ttl):
-        logger.debug(f"Using cached data for {ticker} [{interval}/{period}]")
+    if cache_ttl > 0 and cached and (now - cached["fetched_at"] < cache_ttl):
+        logger.debug(f"Using cached HL candles for {symbol} [{timeframe}]")
         return cached["df"].copy()
-    try:
-        logger.debug(f"Downloading data for {ticker} with interval {interval} and period {period}")
-        df = yf.download(ticker, interval=interval, period=period,
-                         auto_adjust=True, progress=False)
-        if df is None or df.empty:
-            logger.warning(f"No data returned for {ticker}")
-            return None
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        df.dropna(inplace=True)
-        logger.debug(f"Successfully downloaded {len(df)} rows for {ticker}")
-        _DATA_CACHE[cache_key] = {"fetched_at": now, "df": df.copy()}
-        return df
-    except Exception as e:
-        logger.error(f"Download error for {ticker}: {e}")
+    if not isinstance(resolved_asset_id, int) or resolved_asset_id < 0:
+        logger.warning(f"HL candles skipped for {coin}: invalid asset_id for {symbol}")
         return None
+    try:
+        raw_df = get_hl_candles_df(resolved_asset_id, timeframe, limit)
+    except Exception as exc:
+        logger.warning(f"HL candles failed for {coin}: {exc}")
+        return None
+    if raw_df is None or raw_df.empty:
+        logger.warning(f"HL candles unavailable for {coin}")
+        return None
+    df = raw_df.rename(
+        columns={
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+    ).copy()
+    df.index = pd.DatetimeIndex(raw_df["ts"])
+    if limit > 0:
+        df = df.tail(limit).copy()
+    if scan_cache is not None:
+        existing = scan_cache.get(scan_key)
+        if not existing or existing.get("limit", 0) < limit:
+            scan_cache[scan_key] = {"limit": limit, "df": df.copy()}
+    _DATA_CACHE[cache_key] = {"fetched_at": now, "df": df.copy()}
+    return df
 
 
 def calculate_indicators(df: pd.DataFrame, kc_scalar: float | None = None) -> dict | None:
@@ -446,7 +921,7 @@ def calculate_indicators(df: pd.DataFrame, kc_scalar: float | None = None) -> di
         # < 50% of average volume is often noise rather than a real band touch.
         #
         # IMPORTANT: use iloc[-2] (most recently completed bar) NOT iloc[-1].
-        # The last bar returned by yfinance is the still-forming current candle;
+        # The last row in a live candle snapshot is the still-forming current candle;
         # its volume fraction of a full bar makes vol_ratio ≈ 0 and trips the
         # gate on every coin, falsely blocking all legitimate signals.
         vol_ratio = 1.0   # neutral default if volume unavailable
@@ -476,6 +951,7 @@ def calculate_indicators(df: pd.DataFrame, kc_scalar: float | None = None) -> di
             "kc_mid":   _round_price(_safe(ema_mid.iloc[-1])),
             "kc_lower": _round_price(_safe(kc_lower.iloc[-1])),
             "atr":      round(atr_now, 6),   # ATR also sub-cent for BONK/SHIB
+            "atr_pct":  round((atr_now / price_now) if price_now else 0.0, 4),
             "ma_fast":  _round_price(_safe(ma_fast.iloc[-1])),
             "ma_slow":  _round_price(_safe(ma_slow.iloc[-1])),
             "ma_trend": _round_price(_safe(ma_trend.iloc[-1])),
@@ -490,7 +966,22 @@ def calculate_indicators(df: pd.DataFrame, kc_scalar: float | None = None) -> di
             "vol_ratio":    vol_ratio,   # current bar vol / 20-bar avg vol
             "entry_quality": entry_quality,
             "entry_quality_side": entry_quality_side,
+            "band_width_pct": round(
+                ((_safe(kc_upper.iloc[-1]) - _safe(kc_lower.iloc[-1])) / price_now)
+                if price_now else 0.0,
+                4,
+            ),
         }
+
+        latest.update(
+            _detect_liquidation_cascade(
+                df,
+                price=price_now,
+                atr_value=atr_now,
+                kc_upper=_safe(kc_upper.iloc[-1]),
+                kc_lower=_safe(kc_lower.iloc[-1]),
+            )
+        )
 
         # ── Derived labels for AI prompt readability ───────────────────────
         latest["price_vs_kc"] = (
@@ -530,21 +1021,31 @@ def calculate_indicators(df: pd.DataFrame, kc_scalar: float | None = None) -> di
         return None
 
 
-def get_indicators_for_coin(coin: str, coin_cfg: dict) -> dict | None:
+def get_indicators_for_coin(coin: str, coin_cfg: dict, market_data_cache: dict | None = None) -> dict | None:
     """
-    Convenience wrapper: download + calculate for a coin config dict.
+    Convenience wrapper: fetch HL candles + calculate for a coin config dict.
     Routes to supertrend or mean-reversion indicators based on strategy_type.
     """
     logger.debug(f"Getting indicators for {coin}")
-    df = download_data(coin_cfg["ticker"], coin_cfg["interval"], coin_cfg["period"])
+    df = get_market_data(
+        coin,
+        coin_cfg["interval"],
+        coin_cfg["period"],
+        asset_id=coin_cfg.get("asset_id"),
+        hl_symbol=coin_cfg.get("hl_symbol", coin),
+        warmup_bars=250,
+        scan_cache=market_data_cache,
+    )
     if df is None:
-        logger.warning(f"Failed to download data for {coin}")
+        logger.warning(f"Failed to fetch HL candles for {coin}")
         return None
     cache_key = (
         coin,
         coin_cfg["interval"],
         coin_cfg["period"],
         coin_cfg.get("strategy_type", "mean_reversion"),
+        str(coin_cfg.get("timeframes", {})),
+        tuple(coin_cfg.get("allowed_regimes", ()) or ()),
         coin_cfg.get("kc_scalar", KC_SCALAR),
         coin_cfg.get("st_period"),
         coin_cfg.get("st_multiplier"),
@@ -592,6 +1093,16 @@ def get_indicators_for_coin(coin: str, coin_cfg: dict) -> dict | None:
 
     if indicators:
         logger.debug(f"Successfully calculated indicators for {coin}")
+        mtf_context = _build_multi_timeframe_context(coin, coin_cfg, market_data_cache=market_data_cache)
+        indicators["mtf"] = mtf_context
+        indicators["htf_trend"] = mtf_context["higher"].get("trend", "neutral")
+        indicators["mid_tf_trend"] = mtf_context["mid"].get("trend", "neutral")
+        indicators["entry_tf"] = mtf_context["entry"].get("interval", coin_cfg.get("interval"))
+        indicators["mtf_direction"] = mtf_context.get("direction", "neutral")
+        indicators["mtf_alignment"] = mtf_context.get("aligned", False)
+        indicators["regime"] = _classify_trading_regime(indicators, mtf_context)
+        indicators["allowed_regimes"] = _resolve_allowed_regimes(coin_cfg)
+        indicators["strategy_regime_match"] = strategy_matches_regime(coin_cfg, indicators["regime"])
         _INDICATOR_CACHE[cache_key] = {"signature": signature, "indicators": dict(indicators)}
     else:
         logger.warning(f"Failed to calculate indicators for {coin}")
@@ -599,7 +1110,7 @@ def get_indicators_for_coin(coin: str, coin_cfg: dict) -> dict | None:
     return indicators
 
 
-def get_trend_bias(coin: str, coin_cfg: dict) -> dict:
+def get_trend_bias(coin: str, coin_cfg: dict, market_data_cache: dict | None = None) -> dict:
     """
     Fetch the daily (1d) trend for a coin and return a simple bias dict.
     Used as higher-timeframe context for the AI advisor.
@@ -609,7 +1120,15 @@ def get_trend_bias(coin: str, coin_cfg: dict) -> dict:
     daily_cfg["interval"] = "1d"
     daily_cfg["period"]   = "90d"
 
-    df = download_data(daily_cfg["ticker"], daily_cfg["interval"], daily_cfg["period"])
+    df = get_market_data(
+        coin,
+        daily_cfg["interval"],
+        daily_cfg["period"],
+        asset_id=daily_cfg.get("asset_id", coin_cfg.get("asset_id")),
+        hl_symbol=daily_cfg.get("hl_symbol", coin_cfg.get("hl_symbol", coin)),
+        warmup_bars=120,
+        scan_cache=market_data_cache,
+    )
     if df is None or len(df) < 50:
         logger.warning(f"Insufficient daily data for {coin}")
         return {"coin": coin, "trend": "neutral", "rsi": 50.0,
@@ -642,6 +1161,10 @@ def get_trend_bias(coin: str, coin_cfg: dict) -> dict:
         "hurst":         ind["hurst"],
         "market_regime": ind["market_regime"],
         "adx":           ind["adx"],
+        "regime":        _classify_trading_regime(
+            ind,
+            _build_multi_timeframe_context(coin, daily_cfg, market_data_cache=market_data_cache),
+        ),
     }
     _TREND_BIAS_CACHE[cache_key] = {"signature": signature, "bias": dict(result)}
     
@@ -732,3 +1255,89 @@ def print_indicators(indicators: dict) -> None:
               f"  MA={ma_color}{ma_abbr}{Style.RESET_ALL}"
               f"  ADX={adx:.0f}({adx_s})"
               f"  Vol×{vol_r:.1f}{vol_warn}")
+def get_coin_config(coin: str) -> dict | None:
+    """Return a shallow copy of a coin config with resolved HL identifiers."""
+    cfg = COINS.get(coin)
+    if not isinstance(cfg, dict):
+        return None
+    resolved = dict(cfg)
+    resolved.setdefault("hl_symbol", coin)
+    if not isinstance(resolved.get("asset_id"), int):
+        asset_id = resolve_asset_id(resolved["hl_symbol"])
+        if isinstance(asset_id, int):
+            resolved["asset_id"] = asset_id
+    return resolved
+
+
+def prefetch_scan_market_data(
+    active_coins: dict[str, dict],
+    *,
+    ai_enabled: bool = False,
+    include_btc_filter: bool = False,
+) -> dict:
+    """
+    Preload all candle frames needed for a scan into a scan-scoped cache.
+    Each (asset_id, timeframe) is fetched once using the largest required lookback.
+    """
+    requests: dict[tuple[int, str], dict] = {}
+
+    def _register_request(
+        coin: str,
+        cfg: dict,
+        timeframe: str,
+        lookback: str | int,
+        warmup_bars: int,
+    ) -> None:
+        hl_symbol = str(cfg.get("hl_symbol", coin)).strip().upper()
+        asset_id = cfg.get("asset_id")
+        if not isinstance(asset_id, int):
+            asset_id = resolve_asset_id(hl_symbol)
+        if not isinstance(asset_id, int) or asset_id < 0:
+            return
+        limit = bars_for_lookback(timeframe, lookback, warmup_bars=warmup_bars)
+        if limit <= 0:
+            return
+        key = (asset_id, timeframe)
+        existing = requests.get(key)
+        if not existing or existing["limit"] < limit:
+            requests[key] = {
+                "coin": coin,
+                "hl_symbol": hl_symbol,
+                "asset_id": asset_id,
+                "timeframe": timeframe,
+                "lookback": lookback,
+                "warmup_bars": warmup_bars,
+                "limit": limit,
+            }
+
+    for coin, cfg in active_coins.items():
+        _register_request(coin, cfg, cfg.get("interval", "5m"), cfg.get("period", "60d"), 250)
+        tf_cfg = _normalize_mtf_config(cfg)
+        for tf_name in ("higher", "mid"):
+            tf = tf_cfg[tf_name]
+            _register_request(coin, cfg, tf["interval"], tf["period"], 120)
+        if ai_enabled:
+            _register_request(coin, cfg, "1d", "90d", 120)
+
+    if include_btc_filter:
+        btc_cfg = get_coin_config("BTC") or {"hl_symbol": "BTC"}
+        btc_cfg["interval"] = BTC_FILTER_INTERVAL
+        btc_cfg["period"] = BTC_FILTER_PERIOD
+        _register_request("BTC", btc_cfg, btc_cfg["interval"], btc_cfg["period"], 120)
+        btc_tf_cfg = _normalize_mtf_config(btc_cfg)
+        for tf_name in ("higher", "mid"):
+            tf = btc_tf_cfg[tf_name]
+            _register_request("BTC", btc_cfg, tf["interval"], tf["period"], 120)
+
+    scan_cache: dict = {}
+    for request in sorted(requests.values(), key=lambda item: item["limit"], reverse=True):
+        get_market_data(
+            request["coin"],
+            request["timeframe"],
+            request["lookback"],
+            asset_id=request["asset_id"],
+            hl_symbol=request["hl_symbol"],
+            warmup_bars=request["warmup_bars"],
+            scan_cache=scan_cache,
+        )
+    return scan_cache

@@ -33,6 +33,12 @@ class TestCliActions(unittest.TestCase):
                 "sortino_ratio": 1.8,
                 "brier_score": 0.14,
                 "calibrated_trades": 7,
+                "pnl_by_coin": [{"coin": "SOL", "trade_count": 2, "win_rate": 50.0, "profit_factor": 2.0, "avg_pnl": 5.0, "total_pnl": 10.0}],
+                "pnl_by_strategy_type": [{"strategy_type": "mean_reversion", "trade_count": 2, "win_rate": 50.0, "profit_factor": 2.0, "avg_pnl": 5.0, "total_pnl": 10.0}],
+                "pnl_by_hour": [{"hour": 10, "trade_count": 2, "win_rate": 50.0, "profit_factor": 2.0, "avg_pnl": 5.0, "total_pnl": 10.0}],
+                "pnl_by_weekday": [{"weekday": "Monday", "trade_count": 2, "win_rate": 50.0, "profit_factor": 2.0, "avg_pnl": 5.0, "total_pnl": 10.0}],
+                "pnl_by_entry_context": [{"entry_context": "cascade", "trade_count": 1, "win_rate": 100.0, "profit_factor": 3.0, "avg_pnl": 10.0, "total_pnl": 10.0}],
+                "breakdown_by_coin_and_context": [{"entry_context": "cascade", "trade_count": 1, "win_rate": 100.0, "profit_factor": 3.0, "avg_pnl": 10.0, "total_pnl": 10.0}],
             },
             load_trades=lambda: [{"timestamp": "2024-01-01 10:00:00", "coin": "SOL", "side": "long", "pnl": "10.0", "reason": "tp"}],
             printer=printer,
@@ -43,6 +49,11 @@ class TestCliActions(unittest.TestCase):
         self.assertIn("Performance Report", output)
         self.assertIn("Sharpe ratio:", output)
         self.assertIn("Brier score:", output)
+        self.assertIn("PnL by Coin:", output)
+        self.assertIn("PnL by Strategy:", output)
+        self.assertIn("PnL by Hour:", output)
+        self.assertIn("PnL by Weekday:", output)
+        self.assertIn("PnL by Context:", output)
         self.assertIn("Last 1 trades:", output)
 
     def test_render_view_positions_shows_wallet_and_positions(self):

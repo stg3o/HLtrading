@@ -28,7 +28,6 @@ Pass a partial dict — only keys you want to override need to be present.
 import math
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import pandas_ta as ta
 from colorama import Fore, Style
 
@@ -59,6 +58,17 @@ _DEFAULT_SIM_PARAMS: dict = {
 }
 
 _WARMUP = max(MA_TREND, KC_PERIOD, RSI_PERIOD) + 10
+
+FRICTION_STRESS_SCENARIOS = [
+    {"fee": 0.09, "slippage": 0.00, "entry_delay": 0, "exit_delay": 0},
+    {"fee": 0.12, "slippage": 0.00, "entry_delay": 0, "exit_delay": 0},
+    {"fee": 0.18, "slippage": 0.00, "entry_delay": 0, "exit_delay": 0},
+    {"fee": 0.09, "slippage": 0.03, "entry_delay": 0, "exit_delay": 0},
+    {"fee": 0.12, "slippage": 0.03, "entry_delay": 0, "exit_delay": 0},
+    {"fee": 0.09, "slippage": 0.00, "entry_delay": 1, "exit_delay": 0},
+    {"fee": 0.09, "slippage": 0.00, "entry_delay": 0, "exit_delay": 1},
+    {"fee": 0.18, "slippage": 0.06, "entry_delay": 1, "exit_delay": 1},
+]
 
 
 # ─── SUPERTREND SIMULATION ────────────────────────────────────────────────────
@@ -99,10 +109,10 @@ def _run_backtest_st(coin: str, coin_cfg: dict, period: str = "365d",
     if not silent:
         print(f"  {Fore.CYAN}Fetching {coin} ({ticker}, {interval}, {period})…"
               f"{Style.RESET_ALL}")
-    df = _fetch(ticker, interval, period)
+    df = _fetch(ticker, interval, period, hl_symbol=coin_cfg.get("hl_symbol", coin))
 
     if df is None:
-        return {"coin": coin, "total_trades": 0, "error": "data download failed"}
+        return {"coin": coin, "total_trades": 0, "error": "candle fetch failed"}
 
     min_bars = int(p["st_period"]) + 20
     if len(df) < min_bars:
@@ -132,17 +142,19 @@ def _run_backtest_st(coin: str, coin_cfg: dict, period: str = "365d",
 
 # ─── DATA ─────────────────────────────────────────────────────────────────────
 
-def _fetch(ticker: str, interval: str, period: str) -> pd.DataFrame | None:
+def _fetch(ticker: str, interval: str, period: str, hl_symbol: str | None = None) -> pd.DataFrame | None:
+    """
+    Fetch OHLCV via the Hyperliquid candle pipeline only.
+    """
     try:
-        df = yf.download(ticker, interval=interval, period=period,
-                         auto_adjust=True, progress=False, timeout=30)
-        if df is None:
-            return None
-        if df.empty:
-            return None
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-        df.dropna(inplace=True)
-        return df
+        from strategy import get_market_data
+        return get_market_data(
+            hl_symbol or ticker,
+            interval,
+            period,
+            hl_symbol=hl_symbol,
+            warmup_bars=250,
+        )
     except Exception as e:
         print(Fore.RED + f"  Download error for {ticker}: {e}")
         return None
@@ -250,7 +262,7 @@ def run_backtest(coin: str, coin_cfg: dict, period: str | None = None,
     ----------
     coin     : coin label, e.g. "ETH"
     coin_cfg : entry from COINS dict (ticker, interval, period …)
-    period   : yfinance lookback string; defaults to coin_cfg["period"] if None
+    period   : configured lookback string; defaults to coin_cfg["period"] if None
     params   : optional dict of parameter overrides
     silent   : suppress console output (used by optimizer)
     """
@@ -285,10 +297,10 @@ def run_backtest(coin: str, coin_cfg: dict, period: str | None = None,
 
     if not silent:
         print(f"  {Fore.CYAN}Fetching {coin} ({ticker}, {interval}, {period})…{Style.RESET_ALL}")
-    df = _fetch(ticker, interval, period)
+    df = _fetch(ticker, interval, period, hl_symbol=coin_cfg.get("hl_symbol", coin))
 
     if df is None:
-        return {"coin": coin, "total_trades": 0, "error": "data download failed"}
+        return {"coin": coin, "total_trades": 0, "error": "candle fetch failed"}
     if len(df) < _WARMUP + 10:
         return {"coin": coin, "total_trades": 0,
                 "error": f"only {len(df)} bars — need {_WARMUP + 10} minimum"}
@@ -315,6 +327,40 @@ def run_backtest(coin: str, coin_cfg: dict, period: str | None = None,
     stats["take_profit_pct"]   = p["take_profit_pct"]
     stats["max_bars_in_trade"] = p["max_bars_in_trade"]
     return stats
+
+
+def run_friction_stress_test(
+    coin: str,
+    coin_cfg: dict,
+    period: str | None = None,
+    params: dict | None = None,
+    scenarios: list[dict] | None = None,
+    silent: bool = False,
+) -> list[dict]:
+    """Run the fixed friction stress-test matrix for one coin."""
+    scenario_list = scenarios or FRICTION_STRESS_SCENARIOS
+    results = []
+    for idx, scenario in enumerate(scenario_list, start=1):
+        stress_params = {
+            **(params or {}),
+            "fixed_round_trip_fee": scenario["fee"],
+            "slippage_pct": scenario["slippage"],
+            "entry_delay_bars": scenario["entry_delay"],
+            "exit_delay_bars": scenario["exit_delay"],
+        }
+        stats = run_backtest(coin, coin_cfg, period=period, params=stress_params, silent=silent)
+        results.append({
+            "scenario": idx,
+            "fee": scenario["fee"],
+            "slippage": scenario["slippage"],
+            "entry_delay": scenario["entry_delay"],
+            "exit_delay": scenario["exit_delay"],
+            "profit_factor": stats.get("profit_factor", 0),
+            "sharpe_ratio": stats.get("sharpe_ratio", 0),
+            "total_trades": stats.get("total_trades", 0),
+            "total_pnl": stats.get("total_pnl", 0),
+        })
+    return results
 
 
 # ─── METRICS ──────────────────────────────────────────────────────────────────

@@ -25,6 +25,14 @@ class TestExecutionService(unittest.TestCase):
         }
         exchange = Mock()
         exchange.update_leverage.return_value = {"status": "ok"}
+        exchange.info.l2_snapshot.return_value = {
+            "levels": [
+                [{"px": "99.9", "sz": "10"}],
+                [{"px": "100.1", "sz": "10"}],
+            ]
+        }
+        exchange.info.asset_to_sz_decimals = {1: 3}
+        exchange.order.return_value = {"status": "error"}
         exchange.market_open.return_value = {"status": "error"}
 
         result = execute_trade(
@@ -35,7 +43,8 @@ class TestExecutionService(unittest.TestCase):
             vol_regime="normal",
             kc_mid=0.0,
             ai_confidence=0.8,
-            coins={"SOL": {"hl_symbol": "SOL", "hl_size": 0.1, "hl_leverage": 4, "sz_decimals": 3}},
+            entry_tags={"cascade_assisted": True, "entry_context": "cascade_trend"},
+            coins={"SOL": {"hl_symbol": "SOL", "asset_id": 1, "hl_size": 0.1, "hl_leverage": 4, "sz_decimals": 3}},
             stop_loss_pct=0.02,
             take_profit_pct=0.05,
             hl_enabled=True,
@@ -62,7 +71,9 @@ class TestExecutionService(unittest.TestCase):
             ai_confidence=0.8,
         )
         exchange.update_leverage.assert_called_once_with(4, "SOL", is_cross=True)
-        exchange.market_open.assert_called_once_with("SOL", True, 0.25, px=100.0, slippage=0.03)
+        self.assertEqual(exchange.market_open.call_count, 2)
+        exchange.market_open.assert_any_call("SOL", True, 0.25, px=100.0, slippage=0.002)
+        exchange.market_open.assert_any_call("SOL", True, 0.25, px=100.0, slippage=0.004)
         risk_manager.open_position.assert_not_called()
 
     def test_close_trade_preserves_cancel_price_close_log_notify_order(self):

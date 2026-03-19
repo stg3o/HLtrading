@@ -35,9 +35,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from colorama import Fore, Style
 
-from backtester import _fetch, _DEFAULT_SIM_PARAMS
+from backtester import _fetch, _DEFAULT_SIM_PARAMS, FRICTION_STRESS_SCENARIOS
 from config import COINS, PAPER_CAPITAL, RISK_PER_TRADE, BEST_CONFIGS_FILE, HL_MAX_POSITION_USD
 from config import KC_PERIOD, MA_TREND, RSI_PERIOD
+from hltrading.research.simulator import _apply_slippage, _finalize_trade
 
 
 # ─── OPTIMIZER SETTINGS ───────────────────────────────────────────────────────
@@ -578,6 +579,446 @@ def _fast_sim_supertrend(cache: "_CoinCache", params: dict,
                           cache.period, cache.date_range_days)
 
 
+def _fast_sim_with_friction(cache: "_CoinCache", params: dict,
+                            start_i: int | None = None,
+                            end_i:   int | None = None) -> dict:
+    """Validation-only mean-reversion sim with friction, keeping optimizer sizing."""
+    from backtester import _compute_stats
+
+    p = {**_DEFAULT_SIM_PARAMS, **params}
+
+    kc_scalar  = float(p["kc_scalar"])
+    rsi_os     = float(p["rsi_oversold"])
+    rsi_ob     = float(p["rsi_overbought"])
+    hurst_cap  = float(p.get("hurst_cap", _DEFAULT_HURST_CAP))
+    ma_filter  = bool(p["ma_trend_filter"])
+    sl_pct     = float(p["stop_loss_pct"])
+    tp_pct     = float(p["take_profit_pct"])
+    min_rr     = float(p["min_rr_ratio"])
+    max_bars   = int(p["max_bars_in_trade"])
+    fixed_round_trip_fee = float(p.get("fixed_round_trip_fee", 0.0))
+    slippage_pct = float(p.get("slippage_pct", 0.0))
+    entry_delay_bars = int(p.get("entry_delay_bars", 0))
+    exit_delay_bars = int(p.get("exit_delay_bars", 0))
+
+    close    = cache.close
+    high     = cache.high
+    low      = cache.low
+    ema_mid  = cache.ema_mid
+    atr      = cache.atr
+    rsi      = cache.rsi
+    ma_tr    = cache.ma_tr
+    hurst    = cache.hurst
+    n        = cache.n
+    warmup   = cache.warmup
+
+    _start = start_i if start_i is not None else warmup
+    _end   = end_i   if end_i   is not None else n
+
+    capital      = float(PAPER_CAPITAL)
+    position     = None
+    pending_entry = None
+    pending_exit = None
+    trades       = []
+    equity_curve = [capital]
+
+    for i in range(_start, _end):
+        bar_close = close[i]
+        bar_high  = high[i]
+        bar_low   = low[i]
+        mid_i     = ema_mid[i]
+        atr_i     = atr[i]
+
+        if pending_exit and i >= pending_exit["fill_i"]:
+            exit_fill = _apply_slippage(bar_close, pending_exit["side"], False, slippage_pct)
+            trade, pnl = _finalize_trade(
+                pending_exit,
+                exit_fill,
+                pending_exit["reason"],
+                i - pending_exit["bar_in"],
+                fixed_round_trip_fee=fixed_round_trip_fee,
+                include_timestamps=False,
+            )
+            capital += pnl
+            trades.append(trade)
+            pending_exit = None
+            position = None
+            equity_curve.append(capital)
+            continue
+        if pending_exit:
+            equity_curve.append(capital)
+            continue
+
+        if pending_entry and i >= pending_entry["fill_i"] and position is None:
+            entry_price = _apply_slippage(bar_close, pending_entry["side"], True, slippage_pct)
+            tp_fallback = round(entry_price * (1 + tp_pct), 6) if pending_entry["side"] == "long" \
+                else round(entry_price * (1 - tp_pct), 6)
+            position = {
+                "side": pending_entry["side"],
+                "entry": entry_price,
+                "size_usd": pending_entry["size_usd"],
+                "size_units": pending_entry["size_usd"] / entry_price if entry_price > 0 else 0,
+                "sl": round(entry_price * (1 - sl_pct), 6) if pending_entry["side"] == "long"
+                      else round(entry_price * (1 + sl_pct), 6),
+                "tp_fallback": tp_fallback,
+                "bar_in": i,
+            }
+            pending_entry = None
+        if pending_entry and position is None:
+            equity_curve.append(capital)
+            continue
+
+        if position is not None:
+            bars_held      = i - position["bar_in"]
+            current_kc_mid = mid_i if not np.isnan(mid_i) else 0.0
+            hit            = None
+
+            if position["side"] == "long":
+                if bar_low <= position["sl"]:
+                    hit = ("stop_loss", position["sl"])
+                elif current_kc_mid > 0 and bar_high >= current_kc_mid:
+                    hit = ("tp_midline", min(bar_high, current_kc_mid))
+                elif bar_high >= position["tp_fallback"]:
+                    hit = ("tp_fixed", position["tp_fallback"])
+                elif bars_held >= max_bars:
+                    hit = ("time_stop", bar_close)
+            else:
+                if bar_high >= position["sl"]:
+                    hit = ("stop_loss", position["sl"])
+                elif current_kc_mid > 0 and bar_low <= current_kc_mid:
+                    hit = ("tp_midline", max(bar_low, current_kc_mid))
+                elif bar_low <= position["tp_fallback"]:
+                    hit = ("tp_fixed", position["tp_fallback"])
+                elif bars_held >= max_bars:
+                    hit = ("time_stop", bar_close)
+
+            if hit:
+                reason, exit_price = hit
+                if exit_delay_bars > 0 and i + exit_delay_bars < _end:
+                    pending_exit = dict(position)
+                    pending_exit["fill_i"] = i + exit_delay_bars
+                    pending_exit["reason"] = f"{reason}_delay{exit_delay_bars}"
+                else:
+                    exit_fill = _apply_slippage(exit_price, position["side"], False, slippage_pct)
+                    trade, pnl = _finalize_trade(
+                        position,
+                        exit_fill,
+                        reason,
+                        bars_held,
+                        fixed_round_trip_fee=fixed_round_trip_fee,
+                        include_timestamps=False,
+                    )
+                    capital += pnl
+                    trades.append(trade)
+                    position = None
+
+            equity_curve.append(capital)
+            continue
+
+        if np.isnan(mid_i) or np.isnan(atr_i):
+            equity_curve.append(capital)
+            continue
+
+        kc_upper_i = mid_i + kc_scalar * atr_i
+        kc_lower_i = mid_i - kc_scalar * atr_i
+        rsi_i      = rsi[i]
+        mat_i      = ma_tr[i]
+        hurst_i    = hurst[i]
+
+        if np.isnan(rsi_i) or np.isnan(mat_i) or np.isnan(hurst_i):
+            equity_curve.append(capital)
+            continue
+        if hurst_i > hurst_cap:
+            equity_curve.append(capital)
+            continue
+
+        action = "hold"
+        if bar_close < kc_lower_i and rsi_i < rsi_os:
+            if (not ma_filter) or (bar_close > mat_i):
+                action = "long"
+        elif bar_close > kc_upper_i and rsi_i > rsi_ob:
+            if (not ma_filter) or (bar_close < mat_i):
+                action = "short"
+
+        if action in ("long", "short"):
+            sl_dist = bar_close * sl_pct
+            if action == "long":
+                tp_mid_dist = max(mid_i - bar_close, 0.0)
+                tp_fallback = bar_close * (1 + tp_pct)
+                tp_target   = mid_i if tp_mid_dist >= bar_close * tp_pct else tp_fallback
+            else:
+                tp_mid_dist = max(bar_close - mid_i, 0.0)
+                tp_fallback = bar_close * (1 - tp_pct)
+                tp_target   = mid_i if tp_mid_dist >= bar_close * tp_pct else tp_fallback
+            tp_dist = abs(bar_close - tp_target)
+            if sl_dist > 0 and (tp_dist / sl_dist) < min_rr:
+                equity_curve.append(capital)
+                continue
+
+            risk_usd = float(PAPER_CAPITAL) * RISK_PER_TRADE
+            size_usd = min(risk_usd / sl_pct, HL_MAX_POSITION_USD)
+
+            if entry_delay_bars > 0 and i + entry_delay_bars < _end:
+                pending_entry = {
+                    "side": action,
+                    "size_usd": size_usd,
+                    "fill_i": i + entry_delay_bars,
+                }
+            else:
+                entry_price = _apply_slippage(bar_close, action, True, slippage_pct)
+                tp_fallback = round(entry_price * (1 + tp_pct), 6) if action == "long" \
+                    else round(entry_price * (1 - tp_pct), 6)
+                position = {
+                    "side": action,
+                    "entry": entry_price,
+                    "size_usd": size_usd,
+                    "size_units": size_usd / entry_price if entry_price > 0 else 0,
+                    "sl": round(entry_price * (1 - sl_pct), 6) if action == "long"
+                          else round(entry_price * (1 + sl_pct), 6),
+                    "tp_fallback": tp_fallback,
+                    "bar_in": i,
+                }
+
+        equity_curve.append(capital)
+
+    if pending_exit:
+        exit_fill = _apply_slippage(close[_end - 1], pending_exit["side"], False, slippage_pct)
+        trade, pnl = _finalize_trade(
+            pending_exit,
+            exit_fill,
+            pending_exit["reason"],
+            (_end - 1) - pending_exit["bar_in"],
+            fixed_round_trip_fee=fixed_round_trip_fee,
+            include_timestamps=False,
+        )
+        capital += pnl
+        trades.append(trade)
+    elif position is not None:
+        exit_fill = _apply_slippage(close[_end - 1], position["side"], False, slippage_pct)
+        trade, pnl = _finalize_trade(
+            position,
+            exit_fill,
+            "end_of_data",
+            (_end - 1) - position["bar_in"],
+            fixed_round_trip_fee=fixed_round_trip_fee,
+            include_timestamps=False,
+        )
+        capital += pnl
+        trades.append(trade)
+
+    return _compute_stats(cache.coin, trades, capital, equity_curve,
+                          cache.period, cache.date_range_days)
+
+
+def _fast_sim_supertrend_with_friction(cache: "_CoinCache", params: dict,
+                                       start_i: int | None = None,
+                                       end_i:   int | None = None) -> dict:
+    """Validation-only Supertrend sim with friction, keeping optimizer sizing."""
+    from backtester import _compute_stats
+
+    st_period     = int(params.get("st_period", 10))
+    st_multiplier = float(params.get("st_multiplier", 3.0))
+    sl_pct        = float(params.get("stop_loss_pct", 0.01))
+    max_bars      = int(params.get("max_bars_in_trade", 168))
+    fixed_round_trip_fee = float(params.get("fixed_round_trip_fee", 0.0))
+    slippage_pct = float(params.get("slippage_pct", 0.0))
+    entry_delay_bars = int(params.get("entry_delay_bars", 0))
+    exit_delay_bars = int(params.get("exit_delay_bars", 0))
+
+    close  = cache.close
+    high   = cache.high
+    low    = cache.low
+    n      = cache.n
+    warmup = cache.warmup
+
+    _start = start_i if start_i is not None else warmup
+    _end   = end_i   if end_i   is not None else n
+
+    prev_c = np.concatenate(([close[0]], close[:-1]))
+    tr     = np.maximum(high - low,
+             np.maximum(np.abs(high - prev_c),
+                        np.abs(low  - prev_c)))
+    atr    = np.full(n, np.nan)
+    if st_period <= n:
+        atr[st_period - 1] = np.mean(tr[:st_period])
+        for i in range(st_period, n):
+            atr[i] = (atr[i - 1] * (st_period - 1) + tr[i]) / st_period
+
+    mid         = (high + low) / 2.0
+    upper_basic = mid + st_multiplier * atr
+    lower_basic = mid - st_multiplier * atr
+    upper       = np.copy(upper_basic)
+    lower       = np.copy(lower_basic)
+    direction   = np.zeros(n, dtype=np.int8)
+    st_line     = np.full(n, np.nan)
+
+    s = st_period
+    if s < n:
+        direction[s] = 1
+        st_line[s]   = lower[s]
+        for i in range(s + 1, n):
+            if np.isnan(upper[i]) or np.isnan(lower[i]):
+                direction[i] = direction[i - 1]
+                continue
+            upper[i] = (min(upper_basic[i], upper[i - 1])
+                        if close[i - 1] <= upper[i - 1] else upper_basic[i])
+            lower[i] = (max(lower_basic[i], lower[i - 1])
+                        if close[i - 1] >= lower[i - 1] else lower_basic[i])
+            if close[i] > upper[i - 1]:
+                direction[i] = 1
+            elif close[i] < lower[i - 1]:
+                direction[i] = -1
+            else:
+                direction[i] = direction[i - 1]
+            st_line[i] = lower[i] if direction[i] == 1 else upper[i]
+
+    capital      = float(PAPER_CAPITAL)
+    position     = None
+    pending_entry = None
+    pending_exit = None
+    trades       = []
+    equity_curve = [capital]
+
+    for i in range(max(_start, s + 1), _end):
+        bar_close = close[i]
+        d_now     = direction[i]
+        d_prev    = direction[i - 1]
+        flipped   = d_now != d_prev
+
+        if pending_exit and i >= pending_exit["fill_i"]:
+            exit_fill = _apply_slippage(bar_close, pending_exit["side"], False, slippage_pct)
+            trade, pnl = _finalize_trade(
+                pending_exit,
+                exit_fill,
+                pending_exit["reason"],
+                i - pending_exit["bar_in"],
+                fixed_round_trip_fee=fixed_round_trip_fee,
+                include_timestamps=False,
+            )
+            capital += pnl
+            trades.append(trade)
+            pending_exit = None
+            position = None
+            equity_curve.append(capital)
+            continue
+        if pending_exit:
+            equity_curve.append(capital)
+            continue
+
+        if pending_entry and i >= pending_entry["fill_i"] and position is None:
+            entry_price = _apply_slippage(bar_close, pending_entry["side"], True, slippage_pct)
+            position = {
+                "side": pending_entry["side"],
+                "entry": entry_price,
+                "size_usd": pending_entry["size_usd"],
+                "size_units": pending_entry["size_usd"] / entry_price if entry_price > 0 else 0,
+                "sl": round(entry_price * (1 - sl_pct), 6) if pending_entry["side"] == "long"
+                      else round(entry_price * (1 + sl_pct), 6),
+                "bar_in": i,
+            }
+            pending_entry = None
+        if pending_entry and position is None:
+            equity_curve.append(capital)
+            continue
+
+        if position is not None:
+            bars_held = i - position["bar_in"]
+            hit       = None
+
+            if position["side"] == "long":
+                if bar_close <= position["sl"]:
+                    hit = ("stop_loss", position["sl"])
+                elif d_now == -1 and flipped:
+                    hit = ("st_flip", bar_close)
+                elif bars_held >= max_bars:
+                    hit = ("time_stop", bar_close)
+            else:
+                if bar_close >= position["sl"]:
+                    hit = ("stop_loss", position["sl"])
+                elif d_now == 1 and flipped:
+                    hit = ("st_flip", bar_close)
+                elif bars_held >= max_bars:
+                    hit = ("time_stop", bar_close)
+
+            if hit:
+                reason, exit_price = hit
+                if exit_delay_bars > 0 and i + exit_delay_bars < _end:
+                    pending_exit = dict(position)
+                    pending_exit["fill_i"] = i + exit_delay_bars
+                    pending_exit["reason"] = f"{reason}_delay{exit_delay_bars}"
+                else:
+                    exit_fill = _apply_slippage(exit_price, position["side"], False, slippage_pct)
+                    trade, pnl = _finalize_trade(
+                        position,
+                        exit_fill,
+                        reason,
+                        bars_held,
+                        fixed_round_trip_fee=fixed_round_trip_fee,
+                        include_timestamps=False,
+                    )
+                    capital += pnl
+                    trades.append(trade)
+                    position = None
+
+            equity_curve.append(capital)
+            continue
+
+        if not flipped or np.isnan(st_line[i]):
+            equity_curve.append(capital)
+            continue
+
+        action = "long" if d_now == 1 else "short"
+        risk_usd   = float(PAPER_CAPITAL) * RISK_PER_TRADE
+        size_usd   = min(risk_usd / sl_pct, HL_MAX_POSITION_USD)
+
+        if entry_delay_bars > 0 and i + entry_delay_bars < _end:
+            pending_entry = {
+                "side": action,
+                "size_usd": size_usd,
+                "fill_i": i + entry_delay_bars,
+            }
+        else:
+            entry_price = _apply_slippage(bar_close, action, True, slippage_pct)
+            position = {
+                "side": action,
+                "entry": entry_price,
+                "size_usd": size_usd,
+                "size_units": size_usd / entry_price if entry_price > 0 else 0,
+                "sl": round(entry_price * (1 - sl_pct), 6) if action == "long"
+                      else round(entry_price * (1 + sl_pct), 6),
+                "bar_in": i,
+            }
+        equity_curve.append(capital)
+
+    if pending_exit:
+        exit_fill = _apply_slippage(close[_end - 1], pending_exit["side"], False, slippage_pct)
+        trade, pnl = _finalize_trade(
+            pending_exit,
+            exit_fill,
+            pending_exit["reason"],
+            (_end - 1) - pending_exit["bar_in"],
+            fixed_round_trip_fee=fixed_round_trip_fee,
+            include_timestamps=False,
+        )
+        capital += pnl
+        trades.append(trade)
+    elif position is not None:
+        exit_fill = _apply_slippage(close[_end - 1], position["side"], False, slippage_pct)
+        trade, pnl = _finalize_trade(
+            position,
+            exit_fill,
+            "end_of_data",
+            (_end - 1) - position["bar_in"],
+            fixed_round_trip_fee=fixed_round_trip_fee,
+            include_timestamps=False,
+        )
+        capital += pnl
+        trades.append(trade)
+
+    return _compute_stats(cache.coin, trades, capital, equity_curve,
+                          cache.period, cache.date_range_days)
+
+
 # ─── SCORING ──────────────────────────────────────────────────────────────────
 
 def _min_trades_for(interval: str) -> int:
@@ -593,6 +1034,16 @@ def _min_trades_for(interval: str) -> int:
     generate 100–280 trades, just a sanity gate against empty results.
     """
     return MIN_TRADES_1H if interval in ("1h", "4h", "1d") else MIN_TRADES_5M
+
+
+# Minimum backtest PF for a config to be considered deployable.
+# Raised from the informal 1.2 threshold used in config comments.
+# Rationale: fees (~0.045% round-trip) + live slippage typically consume 0.10–0.15
+# PF from a backtest result. A backtest PF of 1.2 becomes ~1.05–1.10 live —
+# barely above breakeven and within noise. 1.35 leaves a real margin.
+# Note: backtest trades already deduct fees (via _finalize_trade), so the
+# backtest PF is net-of-fee. The 0.15 buffer accounts for live slippage only.
+_MIN_PF_TO_QUALIFY = 1.35
 
 
 def _score_single(result: dict, min_trades: int = MIN_TRADES_5M) -> tuple:
@@ -613,6 +1064,8 @@ def _score_single(result: dict, min_trades: int = MIN_TRADES_5M) -> tuple:
     pf = result.get("profit_factor", 0)
     if pf == float("inf") or str(pf) == "inf":
         pf = 10.0
+    if float(pf) < _MIN_PF_TO_QUALIFY:
+        return 0.0, 0.0, 0.0   # below friction-adjusted minimum — not deployable live
     sharpe = _safe_float(result.get("sharpe_ratio", 0))
     return float(pf), float(result.get("win_rate", 0)), sharpe
 
@@ -1026,6 +1479,150 @@ def run_walk_forward(train_frac: float = 0.70) -> None:
                        + (f", only {v_n} trades in holdout" if v_n < 2 else "")
                        + ")")
         print(f"\n{verdict}{Style.RESET_ALL}\n")
+
+
+def run_walk_forward_friction(
+    selected_coins: list[str] | None = None,
+    train_frac: float = 0.70,
+    scenarios: list[dict] | None = None,
+) -> dict[str, dict]:
+    """
+    Find the best train config on the walk-forward train slice, then run the
+    baseline validation and 8 friction scenarios on the validation slice only.
+    """
+    scenario_list = scenarios or FRICTION_STRESS_SCENARIOS
+    coins = selected_coins or ["ETH", "SOL", "DOGE", "WIF", "BONK", "AVAX", "LINK"]
+    results_by_coin: dict[str, dict] = {}
+
+    print(f"\n  {Fore.CYAN}{'═'*64}")
+    print(f"  {Fore.CYAN}  WALK-FORWARD FRICTION VALIDATION"
+          f"  (train {int(train_frac*100)}% / validate {int((1-train_frac)*100)}%)")
+    print(f"  {Fore.CYAN}{'═'*64}{Style.RESET_ALL}\n")
+
+    for coin in coins:
+        cfg = COINS.get(coin)
+        if not cfg:
+            print(Fore.YELLOW + f"  {coin}: not configured — skipping" + Style.RESET_ALL)
+            continue
+
+        ticker   = cfg["ticker"]
+        interval = cfg["interval"]
+        period   = cfg["period"]
+        strategy_type = cfg.get("strategy_type", "mean_reversion")
+
+        print(f"  {Fore.CYAN}{'─'*64}")
+        print(f"  {Fore.CYAN}  {coin}  ({interval} / {period})")
+        print(f"  {Fore.CYAN}{'─'*64}{Style.RESET_ALL}")
+
+        print(f"  Downloading {coin} ({ticker})…", end="", flush=True)
+        df = _fetch(ticker, interval, period)
+        if df is None or df.empty:
+            print(Fore.RED + " FAILED — skipping" + Style.RESET_ALL)
+            continue
+
+        cache = _precompute(coin, interval, df, period)
+        if cache is None:
+            print(Fore.RED + " insufficient data — skipping" + Style.RESET_ALL)
+            continue
+
+        n_valid = cache.n - cache.warmup
+        split_i = cache.warmup + int(n_valid * train_frac)
+        print(Fore.GREEN + f" {cache.n:,} bars  (split at bar {split_i})" + Style.RESET_ALL)
+
+        keys, combos = _build_grid(coin)
+        min_trades_train = max(3, int(_min_trades_for(interval) * train_frac))
+        best_params: dict | None = None
+        best_score = 0.0
+        best_train_result: dict = {}
+
+        for values in combos:
+            params = dict(zip(keys, values))
+            if strategy_type == "mean_reversion":
+                params["rsi_overbought"] = 100 - params["rsi_oversold"]
+                result = _fast_sim(cache, params, end_i=split_i)
+            else:
+                result = _fast_sim_supertrend(cache, params, end_i=split_i)
+            score, _, _ = _score_single(result, min_trades_train)
+            if score > 0 and score > best_score:
+                best_score = score
+                best_params = params
+                best_train_result = result
+
+        if best_params is None:
+            print(Fore.YELLOW
+                  + f"  No config passed min_trades={min_trades_train} on training window\n"
+                  + Style.RESET_ALL)
+            continue
+
+        if strategy_type == "mean_reversion":
+            baseline = _fast_sim(cache, best_params, start_i=split_i)
+        else:
+            baseline = _fast_sim_supertrend(cache, best_params, start_i=split_i)
+
+        scenario_results = []
+        for idx, scenario in enumerate(scenario_list, start=1):
+            stress_params = {
+                **best_params,
+                "fixed_round_trip_fee": scenario["fee"],
+                "slippage_pct": scenario["slippage"],
+                "entry_delay_bars": scenario["entry_delay"],
+                "exit_delay_bars": scenario["exit_delay"],
+            }
+            if strategy_type == "mean_reversion":
+                stressed = _fast_sim_with_friction(cache, stress_params, start_i=split_i)
+            else:
+                stressed = _fast_sim_supertrend_with_friction(cache, stress_params, start_i=split_i)
+            scenario_results.append({
+                "scenario": idx,
+                "fee": scenario["fee"],
+                "slippage": scenario["slippage"],
+                "entry_delay": scenario["entry_delay"],
+                "exit_delay": scenario["exit_delay"],
+                "profit_factor": stressed.get("profit_factor", 0),
+                "sharpe_ratio": stressed.get("sharpe_ratio", 0),
+                "total_trades": stressed.get("total_trades", 0),
+                "total_pnl": stressed.get("total_pnl", 0),
+            })
+
+        p = best_params
+        if strategy_type == "supertrend":
+            config_str = (
+                f"Supertrend({p.get('st_period')},{p.get('st_multiplier')})  "
+                f"sl={p.get('stop_loss_pct', 0)*100:.1f}%"
+            )
+        else:
+            config_str = (
+                f"kc={p.get('kc_scalar')}  "
+                f"rsi={int(p.get('rsi_oversold'))}/{int(p.get('rsi_overbought'))}  "
+                f"sl={p.get('stop_loss_pct', 0)*100:.1f}%  "
+                f"hurst≤{p.get('hurst_cap', _DEFAULT_HURST_CAP)}  "
+                f"{'MA_filter=ON' if p.get('ma_trend_filter') else 'MA_filter=OFF'}"
+            )
+        print(f"  Best train config: {config_str}\n")
+
+        print(f"  {'validate':>10}  {'pf':>6}  {'sharpe':>7}  {'trades':>7}  {'pnl':>11}")
+        print(f"  {'baseline':>10}  {_fmt_pf(baseline.get('profit_factor', 0)):>6}  "
+              f"{_safe_float(baseline.get('sharpe_ratio', 0)):>7.2f}  "
+              f"{baseline.get('total_trades', 0):>7}  "
+              f"${baseline.get('total_pnl', 0):>+10.2f}")
+        for row in scenario_results:
+            print(f"  {('#' + str(row['scenario'])):>10}  {_fmt_pf(row['profit_factor']):>6}  "
+                  f"{_safe_float(row['sharpe_ratio']):>7.2f}  {row['total_trades']:>7}  "
+                  f"${row['total_pnl']:>+10.2f}    "
+                  f"(fee={row['fee']:.2f}, slip={row['slippage']:.2f}, "
+                  f"in={row['entry_delay']}, out={row['exit_delay']})")
+
+        results_by_coin[coin] = {
+            "best_config": best_params,
+            "train_result": best_train_result,
+            "validation_result": baseline,
+            "friction_results": scenario_results,
+            "split_index": split_i,
+            "strategy_type": strategy_type,
+        }
+        print()
+
+    return results_by_coin
 
 
 def apply_best_to_config(coin: str, entry: dict) -> None:

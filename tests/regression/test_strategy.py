@@ -17,8 +17,10 @@ if ROOT not in sys.path:
 
 from strategy import (
     calculate_indicators, calculate_supertrend_indicators,
-    download_data, get_indicators_for_coin, get_trend_bias,
-    _adx, _hurst, _momentum_score, _vol_regime, _trend_slope, _classify_regime_gate
+    get_market_data, get_indicators_for_coin, get_trend_bias,
+    _adx, _hurst, _momentum_score, _vol_regime, _trend_slope, _classify_regime_gate,
+    attach_derivatives_context, get_btc_market_filter,
+    select_strategy_candidates, strategy_matches_regime,
 )
 from ai_advisor import _rule_based_signal
 
@@ -134,6 +136,65 @@ class TestIndicatorCalculations(unittest.TestCase):
         self.assertIsInstance(indicators, dict)
         self.assertIn('kc_upper', indicators)
         self.assertIn('kc_lower', indicators)
+        self.assertIn('atr_pct', indicators)
+
+    def test_attach_derivatives_context_marks_extreme_funding_and_oi_confirmation(self):
+        indicators = {
+            "price": 101.0,
+            "strategy_regime_match": True,
+            "mtf_alignment": True,
+            "entry_quality": 0.5,
+            "regime": "trend",
+            "atr_pct": 0.01,
+            "band_width_pct": 0.02,
+        }
+        attach_derivatives_context("BTC_TEST", {"price": 100.0}, funding_rate=0.0, open_interest=1000.0)
+        enriched = attach_derivatives_context("BTC_TEST", indicators, funding_rate=0.0008, open_interest=1020.0)
+        self.assertTrue(enriched["funding_extreme"])
+        self.assertEqual(enriched["funding_bias"], "short")
+        self.assertEqual(enriched["oi_signal"], "trend_up_confirmed")
+        self.assertTrue(enriched["trend_oi_confirmed"])
+
+    def test_calculate_indicators_detects_cascade_exhaustion(self):
+        data = self.test_data.copy()
+        idx = data.index[-2]
+        data.loc[idx, "Open"] = 100.0
+        data.loc[idx, "Low"] = 99.0
+        data.loc[idx, "High"] = 108.0
+        data.loc[idx, "Close"] = 104.0
+        data.loc[idx, "Volume"] = data["Volume"].iloc[:-1].mean() * 6
+        indicators = calculate_indicators(data, kc_scalar=1.0)
+        self.assertIn("cascade_event", indicators)
+        self.assertIn("cascade_exhaustion", indicators)
+        self.assertIn("extreme_cascade", indicators)
+
+    def test_select_strategy_candidates_prefers_regime_match(self):
+        candidates = [
+            ("BTC", {"hl_symbol": "BTC"}, {"strategy_regime_match": False, "allocator_score": 0.9}),
+            ("BTC_RANGE", {"hl_symbol": "BTC"}, {"strategy_regime_match": True, "allocator_score": 0.2}),
+            ("SOL", {"hl_symbol": "SOL"}, {"strategy_regime_match": True, "allocator_score": 0.5}),
+        ]
+        selected = select_strategy_candidates(candidates)
+        self.assertEqual([coin for coin, _, _ in selected], ["BTC_RANGE", "SOL"])
+
+    def test_strategy_matches_regime_uses_defaults(self):
+        self.assertTrue(strategy_matches_regime({"strategy_type": "mean_reversion"}, "range"))
+        self.assertFalse(strategy_matches_regime({"strategy_type": "mean_reversion"}, "trend"))
+
+    @patch("strategy.get_market_data")
+    @patch("strategy.calculate_indicators")
+    def test_get_btc_market_filter_flags_risk_off(self, mock_calc, mock_download):
+        mock_download.return_value = self.test_data
+        mock_calc.return_value = {
+            "adx": 35.0,
+            "atr_pct": 0.035,
+            "trend_direction": "up",
+            "vol_regime": "high",
+            "band_width_pct": 0.07,
+        }
+        result = get_btc_market_filter()
+        self.assertTrue(result["risk_off"])
+        self.assertTrue(result["trend_spike"])
 
 
 class TestSupertrendCalculations(unittest.TestCase):
@@ -246,45 +307,73 @@ class TestSupertrendCalculations(unittest.TestCase):
         self.assertIn(indicators['st_signal'], ['long', 'short', 'hold'])
 
 
-class TestDownloadData(unittest.TestCase):
-    """Test cases for data downloading functionality"""
+class TestMarketData(unittest.TestCase):
+    """Test cases for Hyperliquid candle retrieval."""
     
-    @patch('strategy.yf.download')
-    def test_download_data_success(self, mock_download):
-        """Test successful data download"""
-        # Mock yfinance download
+    @patch('strategy.resolve_asset_id', return_value=1)
+    @patch('strategy.get_hl_candles_df')
+    def test_get_market_data_success(self, mock_get_hl_candles_df, _mock_resolve_asset_id):
+        """Test successful HL candle download."""
+        dates = pd.date_range('2024-01-01', periods=3, freq='1h', tz='UTC')
         mock_df = pd.DataFrame({
-            'Open': [100, 101, 102],
-            'High': [101, 102, 103],
-            'Low': [99, 100, 101],
-            'Close': [100.5, 101.5, 102.5],
-            'Volume': [1000, 2000, 3000]
+            'ts': dates,
+            'open': [100, 101, 102],
+            'high': [101, 102, 103],
+            'low': [99, 100, 101],
+            'close': [100.5, 101.5, 102.5],
+            'volume': [1000, 2000, 3000]
         })
-        mock_download.return_value = mock_df
-        
-        result = download_data('BTC-USD', '1h', '7d')
-        
+        mock_get_hl_candles_df.return_value = mock_df
+
+        result = get_market_data('BTC', '1h', '7d', hl_symbol='BTC')
+
         self.assertIsInstance(result, pd.DataFrame)
         self.assertEqual(len(result), 3)
-        mock_download.assert_called_once_with('BTC-USD', interval='1h', period='7d', auto_adjust=True, progress=False)
-    
-    @patch('strategy.yf.download')
-    def test_download_data_empty(self, mock_download):
-        """Test data download with empty result"""
-        mock_download.return_value = None
-        
-        result = download_data('BTC-USD', '1h', '7d')
-        
+        self.assertIn('Close', result.columns)
+        mock_get_hl_candles_df.assert_called_once()
+
+    @patch('strategy.resolve_asset_id', return_value=1)
+    @patch('strategy.get_hl_candles_df')
+    def test_get_market_data_empty(self, mock_get_hl_candles_df, _mock_resolve_asset_id):
+        """Test data download with empty result."""
+        mock_get_hl_candles_df.return_value = None
+
+        result = get_market_data('BTC', '1h', '7d', hl_symbol='BTC')
+
         self.assertIsNone(result)
-    
-    @patch('strategy.yf.download')
-    def test_download_data_exception(self, mock_download):
-        """Test data download with exception"""
-        mock_download.side_effect = Exception("Network error")
-        
-        result = download_data('BTC-USD', '1h', '7d')
-        
+
+    @patch('strategy.resolve_asset_id', return_value=1)
+    @patch('strategy.get_hl_candles_df')
+    def test_get_market_data_exception(self, mock_get_hl_candles_df, _mock_resolve_asset_id):
+        """Test data download with exception."""
+        mock_get_hl_candles_df.side_effect = Exception("Network error")
+
+        result = get_market_data('BTC', '1h', '7d', hl_symbol='BTC')
+
         self.assertIsNone(result)
+
+    @patch('strategy.resolve_asset_id', return_value=1)
+    @patch('strategy.get_hl_candles_df')
+    def test_get_market_data_reuses_scan_cache(self, mock_get_hl_candles_df, _mock_resolve_asset_id):
+        """Test per-scan cache reuse for repeated timeframe requests."""
+        dates = pd.date_range('2024-01-01', periods=10, freq='1h', tz='UTC')
+        mock_df = pd.DataFrame({
+            'ts': dates,
+            'open': range(10),
+            'high': range(1, 11),
+            'low': range(10),
+            'close': range(10),
+            'volume': [100] * 10,
+        })
+        mock_get_hl_candles_df.return_value = mock_df
+        scan_cache = {}
+
+        result_1 = get_market_data('BTC', '1h', 5, hl_symbol='BTC', scan_cache=scan_cache)
+        result_2 = get_market_data('BTC', '1h', 3, hl_symbol='BTC', scan_cache=scan_cache)
+
+        self.assertEqual(len(result_1), 5)
+        self.assertEqual(len(result_2), 3)
+        mock_get_hl_candles_df.assert_called_once()
 
 
 class TestCoinIndicators(unittest.TestCase):
@@ -293,7 +382,8 @@ class TestCoinIndicators(unittest.TestCase):
     def setUp(self):
         """Set up test configuration"""
         self.coin_config = {
-            'ticker': 'BTC-USD',
+            'ticker': 'BTC',
+            'hl_symbol': 'BTC',
             'interval': '1h',
             'period': '7d',
             'strategy_type': 'mean_reversion',
@@ -303,7 +393,7 @@ class TestCoinIndicators(unittest.TestCase):
             'rsi_overbought': 70
         }
     
-    @patch('strategy.download_data')
+    @patch('strategy.get_market_data')
     def test_get_indicators_for_coin_mean_reversion(self, mock_download):
         """Test getting indicators for mean-reversion strategy"""
         # Create mock data
@@ -327,11 +417,12 @@ class TestCoinIndicators(unittest.TestCase):
         self.assertEqual(indicators['rsi_oversold'], 30)
         self.assertEqual(indicators['rsi_overbought'], 70)
     
-    @patch('strategy.download_data')
+    @patch('strategy.get_market_data')
     def test_get_indicators_for_coin_supertrend(self, mock_download):
         """Test getting indicators for Supertrend strategy"""
         supertrend_config = {
-            'ticker': 'BTC-USD',
+            'ticker': 'BTC',
+            'hl_symbol': 'BTC',
             'interval': '1h',
             'period': '7d',
             'strategy_type': 'supertrend',
@@ -364,7 +455,7 @@ class TestCoinIndicators(unittest.TestCase):
 class TestTrendBias(unittest.TestCase):
     """Test cases for trend bias calculation"""
     
-    @patch('strategy.download_data')
+    @patch('strategy.get_market_data')
     def test_get_trend_bias(self, mock_download):
         """Test getting daily trend bias"""
         # Create mock daily data
@@ -379,7 +470,8 @@ class TestTrendBias(unittest.TestCase):
         mock_download.return_value = mock_df
         
         coin_config = {
-            'ticker': 'BTC-USD',
+            'ticker': 'BTC',
+            'hl_symbol': 'BTC',
             'interval': '1h',
             'period': '7d'
         }
@@ -395,13 +487,14 @@ class TestTrendBias(unittest.TestCase):
         self.assertIn('market_regime', bias)
         self.assertIn('adx', bias)
     
-    @patch('strategy.download_data')
+    @patch('strategy.get_market_data')
     def test_get_trend_bias_insufficient_data(self, mock_download):
         """Test trend bias with insufficient data"""
         mock_download.return_value = None
         
         coin_config = {
-            'ticker': 'BTC-USD',
+            'ticker': 'BTC',
+            'hl_symbol': 'BTC',
             'interval': '1h',
             'period': '7d'
         }

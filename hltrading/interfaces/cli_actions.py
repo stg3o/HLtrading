@@ -5,7 +5,15 @@ from pathlib import Path
 import urllib.request
 
 
-def render_view_positions(*, risk_manager, print_positions, get_hl_account_info, testnet: bool, printer=print, fore=None, style=None) -> None:
+def render_view_positions(*, risk_manager, print_positions, get_hl_account_info, get_verified_hl_positions, testnet: bool, printer=print, fore=None, style=None) -> None:
+    def _fmt_price(value) -> str:
+        if value in (None, ""):
+            return "—"
+        try:
+            return f"${float(value):,.4f}"
+        except Exception:
+            return "—"
+
     print_positions(risk_manager)
     risk_manager.print_summary()
 
@@ -13,30 +21,33 @@ def render_view_positions(*, risk_manager, print_positions, get_hl_account_info,
     net_label = fore.YELLOW + "TESTNET" if testnet else fore.RED + "MAINNET"
     printer(f"  {fore.CYAN}Hyperliquid Wallet [{net_label}{fore.CYAN}]" + style.RESET_ALL)
     acct = get_hl_account_info()
-    if acct:
+    if acct is not None:
         printer(f"  Total equity   : {fore.GREEN}${acct.get('account_value', 0):,.2f}{style.RESET_ALL}")
         printer(f"    Spot USDC    : ${acct.get('spot_usdc', 0):,.2f}")
         printer(f"    Perps equity : ${acct.get('perps_equity', 0):,.2f}")
         printer(f"  Margin used    : ${acct.get('margin_used', 0):,.2f}")
         printer(f"  Withdrawable   : ${acct.get('withdrawable', 0):,.2f}")
-        hl_positions = acct.get("positions", [])
+        hl_positions = get_verified_hl_positions(print_fn=printer, fore=fore)
         if hl_positions:
             printer("  Open on-chain  :")
-            for position_wrapper in hl_positions:
-                pos = position_wrapper.get("position", {})
-                coin = pos.get("coin", "?")
-                size = pos.get("szi", "0")
-                pnl = float(pos.get("unrealizedPnl", 0))
-                entry = float(pos.get("entryPx", 0))
+            for pos in hl_positions:
+                coin = pos.get("hl_symbol", "?")
+                size = pos.get("size_units", 0)
+                pnl = float(pos.get("unrealized_pnl", 0) or 0)
+                entry = float(pos.get("entry_price", 0) or 0)
+                sl = _fmt_price(pos.get("stop_loss"))
+                tp = _fmt_price(pos.get("take_profit"))
+                protection = "" if pos.get("protected") else "  (UNPROTECTED)"
                 pnl_color = fore.GREEN if pnl >= 0 else fore.RED
                 printer(
-                    f"    {coin:4}  size={size}  entry=${entry:,.4f}  "
+                    f"    {coin:6} {str(pos.get('side', '?')).upper():5} size={size}  "
+                    f"entry=${entry:,.4f}  SL={sl}  TP={tp}{protection}  "
                     f"uPnL={pnl_color}${pnl:+,.2f}{style.RESET_ALL}"
                 )
         else:
             printer("  Open on-chain  : none")
     else:
-        printer(fore.RED + "  Could not fetch wallet info — check credentials and connection.")
+        printer(fore.YELLOW + "  Hyperliquid wallet info unavailable.")
 
 
 def _url_available(url: str) -> bool:
@@ -81,6 +92,72 @@ def open_dashboard_action(*, module_file: str, browser_open, printer=print, fore
 
 
 def render_performance_report(*, performance_report_fn, load_trades, printer=print, fore=None, style=None) -> None:
+    def _fmt_pf(val) -> str:
+        return val if isinstance(val, str) else f"{val:.2f}"
+
+    def _print_summary(title: str, stats: dict, subtitle: str | None = None) -> None:
+        if subtitle:
+            printer(f"\n  {fore.CYAN}{title} ({subtitle})")
+        else:
+            printer(f"\n  {fore.CYAN}{title}")
+        pnl_color = fore.GREEN if stats["total_pnl"] >= 0 else fore.RED
+        pf_str = f"{stats['profit_factor']:.2f}" if stats["profit_factor"] != float("inf") else "∞"
+        printer(f"  Trades:          {stats['total_trades']}")
+        printer(f"  Win rate:        {fore.GREEN if stats['win_rate'] >= 50 else fore.RED}"
+                f"{stats['win_rate']:.1f}%{style.RESET_ALL}")
+        total_fees = stats.get("total_fees", 0.0)
+        printer(f"  Total P&L:       {pnl_color}${stats['total_pnl']:+,.2f}{style.RESET_ALL}"
+                f"  {fore.YELLOW}(fees paid: ${total_fees:,.4f}){style.RESET_ALL}")
+        printer(f"  Avg win:         {fore.GREEN}${stats['avg_win']:,.2f}{style.RESET_ALL}")
+        printer(f"  Avg loss:        {fore.RED}${stats['avg_loss']:,.2f}{style.RESET_ALL}")
+        printer(f"  Profit factor:   {pf_str}")
+        printer(f"  Max drawdown:    {fore.RED}{stats['max_drawdown']:.1f}%{style.RESET_ALL}")
+        printer(f"  Max consec loss: {stats['max_consec_losses']}")
+        printer(f"  Best trade:      {fore.GREEN}${stats['best_trade']:+,.2f}{style.RESET_ALL}")
+        printer(f"  Worst trade:     {fore.RED}${stats['worst_trade']:+,.2f}{style.RESET_ALL}")
+
+        sharpe = stats.get("sharpe_ratio", 0)
+        sortino = stats.get("sortino_ratio", 0)
+        s_color = fore.GREEN if sharpe >= 1.0 else fore.YELLOW if sharpe > 0 else fore.RED
+        o_color = fore.GREEN if sortino >= 1.5 else fore.YELLOW if sortino > 0 else fore.RED
+        sortino_str = f"{sortino:.3f}" if sortino != float("inf") else "∞"
+        printer(f"  Sharpe ratio:    {s_color}{sharpe:.3f}{style.RESET_ALL}"
+                f"  {'✓ good' if sharpe >= 1.0 else '○ target ≥ 1.0'}")
+        printer(f"  Sortino ratio:   {o_color}{sortino_str}{style.RESET_ALL}"
+                f"  {'✓ good' if sortino >= 1.5 else '○ target ≥ 1.5'}")
+
+        brier = stats.get("brier_score")
+        n_cal = stats.get("calibrated_trades", 0)
+        if brier is not None:
+            b_color = (
+                fore.GREEN if brier < 0.15 else
+                fore.YELLOW if brier < 0.20 else fore.RED
+            )
+            b_grade = (
+                "✓ well calibrated" if brier < 0.15 else
+                "○ decent" if brier < 0.20 else
+                "✗ overconfident / poorly calibrated"
+            )
+            printer(f"  Brier score:     {b_color}{brier:.4f}{style.RESET_ALL}"
+                    f"  {b_grade}  (n={n_cal}, 0=perfect, 0.25=random)")
+        else:
+            printer(f"  Brier score:     {fore.YELLOW}— (need ≥5 trades with confidence logged){style.RESET_ALL}")
+
+    def _print_rows(title: str, rows: list[dict], key: str) -> None:
+        if not rows:
+            return
+        printer(f"\n  {fore.CYAN}{title}:")
+        for row in rows:
+            label = row.get(key, "?")
+            pnl = float(row.get("total_pnl", 0) or 0)
+            pnl_color = fore.GREEN if pnl >= 0 else fore.RED
+            printer(
+                f"  {str(label):<12} trades={int(row.get('trade_count', 0)):>3}  "
+                f"wr={row.get('win_rate', 0):>5.1f}%  pf={_fmt_pf(row.get('profit_factor', 0)):<4}  "
+                f"avg={pnl_color}${float(row.get('avg_pnl', 0) or 0):+,.2f}{style.RESET_ALL}  "
+                f"pnl={pnl_color}${pnl:+,.2f}{style.RESET_ALL}"
+            )
+
     stats = performance_report_fn()
     printer(f"\n  {fore.CYAN}Performance Report")
     printer(f"  {fore.CYAN}{'─'*44}")
@@ -89,49 +166,22 @@ def render_performance_report(*, performance_report_fn, load_trades, printer=pri
         printer(fore.YELLOW + "  No closed trades yet.")
         return
 
-    pnl_color = fore.GREEN if stats["total_pnl"] >= 0 else fore.RED
-    pf_str = f"{stats['profit_factor']:.2f}" if stats["profit_factor"] != float("inf") else "∞"
+    _print_summary("All-time", stats.get("all_time", stats))
 
-    printer(f"  Trades:          {stats['total_trades']}")
-    printer(f"  Win rate:        {fore.GREEN if stats['win_rate'] >= 50 else fore.RED}"
-            f"{stats['win_rate']:.1f}%{style.RESET_ALL}")
-    total_fees = stats.get("total_fees", 0.0)
-    printer(f"  Total P&L:       {pnl_color}${stats['total_pnl']:+,.2f}{style.RESET_ALL}"
-            f"  {fore.YELLOW}(fees paid: ${total_fees:,.4f}){style.RESET_ALL}")
-    printer(f"  Avg win:         {fore.GREEN}${stats['avg_win']:,.2f}{style.RESET_ALL}")
-    printer(f"  Avg loss:        {fore.RED}${stats['avg_loss']:,.2f}{style.RESET_ALL}")
-    printer(f"  Profit factor:   {pf_str}")
-    printer(f"  Max drawdown:    {fore.RED}{stats['max_drawdown']:.1f}%{style.RESET_ALL}")
-    printer(f"  Max consec loss: {stats['max_consec_losses']}")
-    printer(f"  Best trade:      {fore.GREEN}${stats['best_trade']:+,.2f}{style.RESET_ALL}")
-    printer(f"  Worst trade:     {fore.RED}${stats['worst_trade']:+,.2f}{style.RESET_ALL}")
+    since_stats = stats.get("since_last_update", {})
+    since_n = int(since_stats.get("total_trades", 0) or 0)
+    subtitle = f"{since_n} trades" if since_n else "0 trades"
+    _print_summary("Since last update", since_stats, subtitle=subtitle)
 
-    sharpe = stats.get("sharpe_ratio", 0)
-    sortino = stats.get("sortino_ratio", 0)
-    s_color = fore.GREEN if sharpe >= 1.0 else fore.YELLOW if sharpe > 0 else fore.RED
-    o_color = fore.GREEN if sortino >= 1.5 else fore.YELLOW if sortino > 0 else fore.RED
-    sortino_str = f"{sortino:.3f}" if sortino != float("inf") else "∞"
-    printer(f"  Sharpe ratio:    {s_color}{sharpe:.3f}{style.RESET_ALL}"
-            f"  {'✓ good' if sharpe >= 1.0 else '○ target ≥ 1.0'}")
-    printer(f"  Sortino ratio:   {o_color}{sortino_str}{style.RESET_ALL}"
-            f"  {'✓ good' if sortino >= 1.5 else '○ target ≥ 1.5'}")
-
-    brier = stats.get("brier_score")
-    n_cal = stats.get("calibrated_trades", 0)
-    if brier is not None:
-        b_color = (
-            fore.GREEN if brier < 0.15 else
-            fore.YELLOW if brier < 0.20 else fore.RED
-        )
-        b_grade = (
-            "✓ well calibrated" if brier < 0.15 else
-            "○ decent" if brier < 0.20 else
-            "✗ overconfident / poorly calibrated"
-        )
-        printer(f"  Brier score:     {b_color}{brier:.4f}{style.RESET_ALL}"
-                f"  {b_grade}  (n={n_cal}, 0=perfect, 0.25=random)")
-    else:
-        printer(f"  Brier score:     {fore.YELLOW}— (need ≥5 trades with confidence logged){style.RESET_ALL}")
+    _print_rows("PnL by Coin", stats.get("pnl_by_coin", []), "coin")
+    _print_rows("PnL by Strategy", stats.get("pnl_by_strategy_type", []), "strategy_type")
+    _print_rows("PnL by Hour", stats.get("pnl_by_hour", []), "hour")
+    _print_rows("Since Update by Coin", stats.get("since_last_update_pnl_by_coin", []), "coin")
+    _print_rows("Since Update by Strategy", stats.get("since_last_update_pnl_by_strategy_type", []), "strategy_type")
+    _print_rows("Since Update by Hour", stats.get("since_last_update_pnl_by_hour", []), "hour")
+    _print_rows("PnL by Weekday", stats.get("pnl_by_weekday", []), "weekday")
+    _print_rows("PnL by Context", stats.get("pnl_by_entry_context", []), "entry_context")
+    _print_rows("Coin x Context", stats.get("breakdown_by_coin_and_context", []), "entry_context")
 
     trades = load_trades()[-5:]
     if trades:

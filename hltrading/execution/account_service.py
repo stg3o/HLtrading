@@ -11,7 +11,7 @@ def get_hl_positions() -> list:
     return _get_hl_positions()
 
 
-def get_hl_account_info() -> dict:
+def get_hl_account_info() -> dict | None:
     """Return unified Hyperliquid account information."""
     return _get_hl_account_info()
 

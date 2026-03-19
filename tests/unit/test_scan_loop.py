@@ -48,6 +48,26 @@ class TestScanLoop(unittest.TestCase):
             "stop_loss_pct": 0.01,
             "hl_enabled": False,
             "get_hl_obi": Mock(),
+            "get_hl_funding_rate": Mock(return_value=None),
+            "get_hl_open_interest": Mock(return_value=None),
+            "attach_derivatives_context": Mock(side_effect=lambda coin, indicators, funding_rate=None, open_interest=None: indicators),
+            "get_btc_market_filter": Mock(return_value={"risk_off": False, "adx": 0.0, "atr_pct": 0.0}),
+            "select_strategy_candidates": Mock(side_effect=lambda candidates: candidates),
+            "allocate_best_strategy_per_symbol": True,
+            "use_funding_rate_signal": True,
+            "use_open_interest_signal": True,
+            "require_oi_confirmation_for_trend": True,
+            "suppress_trend_on_oi_divergence": True,
+            "use_btc_market_filter": True,
+            "btc_filter_suppress_altcoins": True,
+            "btc_alt_signal_confidence_penalty": 0.2,
+            "use_cascade_filter": True,
+            "cascade_trend_confidence_bonus": 0.08,
+            "cascade_mr_entry_quality_bonus": 0.2,
+            "cascade_risk_confidence_penalty": 0.2,
+            "cascade_risk_block_extreme": True,
+            "funding_conflict_penalty": 0.15,
+            "funding_contrarian_bonus": 0.05,
             "obi_gate": 0.0,
             "vol_min_ratio": 0.0,
             "close_trade": Mock(),
@@ -98,3 +118,83 @@ class TestScanLoop(unittest.TestCase):
         kwargs["get_indicators_for_coin"].assert_not_called()
         self.assertEqual(kwargs["bot_running"].wait_calls, [1])
 
+    def test_strategy_allocator_filters_candidates_before_decisioning(self):
+        kwargs = self._base_kwargs()
+        kwargs["active_coins"].return_value = {
+            "BTC": {"hl_symbol": "BTC", "strategy_type": "supertrend", "hl_size": 1},
+            "BTC_RANGE": {"hl_symbol": "BTC", "strategy_type": "mean_reversion", "hl_size": 1},
+        }
+        kwargs["get_indicators_for_coin"].side_effect = [
+            {"coin": "BTC", "price": 100.0, "strategy_regime_match": False, "strategy_type": "supertrend"},
+            {"coin": "BTC_RANGE", "price": 100.0, "strategy_regime_match": True, "strategy_type": "mean_reversion"},
+        ]
+        kwargs["select_strategy_candidates"].side_effect = None
+        kwargs["select_strategy_candidates"].return_value = [
+            ("BTC_RANGE", kwargs["active_coins"].return_value["BTC_RANGE"], {"coin": "BTC_RANGE", "price": 100.0, "strategy_regime_match": True, "strategy_type": "mean_reversion"})
+        ]
+        kwargs["rule_based_signal"].return_value = {"action": "hold", "confidence": 0.0, "reason": "x"}
+
+        run_bot_scan_loop(**kwargs)
+
+        kwargs["rule_based_signal"].assert_called_once()
+
+    def test_btc_risk_off_suppresses_altcoin_signal(self):
+        kwargs = self._base_kwargs()
+        kwargs["active_coins"].return_value = {
+            "SOL_ST": {"hl_symbol": "SOL", "strategy_type": "supertrend", "hl_size": 1},
+        }
+        kwargs["get_indicators_for_coin"].return_value = {
+            "coin": "SOL_ST",
+            "price": 100.0,
+            "strategy_regime_match": True,
+            "strategy_type": "supertrend",
+            "regime": "trend",
+            "oi_signal": "trend_up_confirmed",
+            "funding_bias": "neutral",
+            "funding_extreme": False,
+            "funding_hard_block": False,
+            "extreme_volatility": False,
+        }
+        kwargs["get_btc_market_filter"].return_value = {"risk_off": True, "adx": 35.0, "atr_pct": 0.04}
+        kwargs["select_strategy_candidates"].side_effect = None
+        kwargs["select_strategy_candidates"].return_value = [
+            ("SOL_ST", kwargs["active_coins"].return_value["SOL_ST"], kwargs["get_indicators_for_coin"].return_value)
+        ]
+        kwargs["rule_based_signal"].return_value = {"action": "long", "confidence": 0.8, "reason": "trend"}
+
+        run_bot_scan_loop(**kwargs)
+
+        kwargs["execute_trade"].assert_not_called()
+
+    def test_extreme_cascade_blocks_unstable_entry(self):
+        kwargs = self._base_kwargs()
+        kwargs["active_coins"].return_value = {
+            "BTC": {"hl_symbol": "BTC", "strategy_type": "supertrend", "hl_size": 1},
+        }
+        kwargs["get_indicators_for_coin"].return_value = {
+            "coin": "BTC",
+            "price": 100.0,
+            "strategy_regime_match": True,
+            "strategy_type": "supertrend",
+            "regime": "trend",
+            "oi_signal": "trend_up_confirmed",
+            "funding_bias": "neutral",
+            "funding_extreme": False,
+            "funding_hard_block": False,
+            "extreme_volatility": False,
+            "cascade_event": True,
+            "cascade_direction": "up",
+            "cascade_exhaustion": False,
+            "extreme_cascade": True,
+            "cascade_volume_spike": 5.0,
+            "cascade_range_atr": 3.0,
+        }
+        kwargs["select_strategy_candidates"].side_effect = None
+        kwargs["select_strategy_candidates"].return_value = [
+            ("BTC", kwargs["active_coins"].return_value["BTC"], kwargs["get_indicators_for_coin"].return_value)
+        ]
+        kwargs["rule_based_signal"].return_value = {"action": "long", "confidence": 0.8, "reason": "trend"}
+
+        run_bot_scan_loop(**kwargs)
+
+        kwargs["execute_trade"].assert_not_called()

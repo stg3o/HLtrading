@@ -1,12 +1,5 @@
 {
-  "ADA": false,
-  "AVAX": false,
-  "AVAX_ST": false,
-  "BONK": false,
-  "LINK": false,
-  "LTC": false,
-  "SHIB": false,
-  "SOL_ST": false,
-  "WIF": false,
-  "XRP": false
+  "ETH": {
+    "enabled": false
+  }
 }

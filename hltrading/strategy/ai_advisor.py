@@ -260,10 +260,11 @@ def _ask_openrouter(prompt: str) -> dict:
 
 def _rule_based_signal(indicators: dict) -> dict:
     """
-    Pure rule-based fallback — mirrors the backtester signal logic exactly.
-    Used when both Ollama and OpenRouter are unavailable.
-    Routes to supertrend or mean-reversion logic based on strategy_type.
-    Confidence is 0.75 for a clean signal, 0 for hold.
+    Pure rule-based signal generator.
+    Uses a single pass: compute signal eligibility, then apply soft confidence
+    penalties for adverse regime/quality conditions.  No early returns except on
+    absent data — every valid KC+RSI setup reaches execution with an adjusted
+    confidence rather than a hard veto.
     """
     strategy_type = indicators.get("strategy_type", "mean_reversion")
 
@@ -288,94 +289,81 @@ def _rule_based_signal(indicators: dict) -> dict:
         regime_gate = indicators.get("regime_gate", "neutral")
         entry_quality = float(indicators.get("entry_quality", 0.0))
         entry_quality_side = indicators.get("entry_quality_side", "neutral")
-        entry_quality_min = float(indicators.get("entry_quality_min", max(_MIN_ENTRY_QUALITY, 0.25)))
+        # Use config value directly — no silent 5× override via max(0.05, 0.25)
+        entry_quality_min = float(indicators.get("entry_quality_min", _MIN_ENTRY_QUALITY))
         rsi_os   = float(indicators.get("rsi_oversold",  _RSI_OS_GLOBAL))
         rsi_ob   = float(indicators.get("rsi_overbought", _RSI_OB_GLOBAL))
 
         from config import HURST_GATE, ADX_MR_MAX, HURST_MR_MAX
         adx = float(indicators.get("adx", 0))
 
-        # ── Regime gate 1: ADX ────────────────────────────────────────────────
-        # ADX > ADX_MR_MAX = market trending too hard to fade KC bands.
-        # Three-tier regime:
-        #   ADX ≤ 20          → ranging/choppy  → ideal for KC mean-reversion
-        #   ADX 20–ADX_MR_MAX → moderate trend  → MA filter keeps direction aligned
-        #   ADX > ADX_MR_MAX  → strong trend    → skip mean-reversion entirely
-        if adx > ADX_MR_MAX:
-            return {"action": "hold", "confidence": 0.0,
-                    "reason": f"rules: trending regime (ADX={adx:.1f}>{ADX_MR_MAX}) — skip mean-reversion",
-                    "source": "rules"}
-
-        # ── Regime gate 2: Hurst (secondary) ─────────────────────────────────
-        # Hurst ≥ HURST_MR_MAX = price exhibiting trend persistence, not mean-reversion.
-        # Slower than ADX (~16h lookback on 5m) but catches sustained multi-hour trends.
-        if HURST_GATE and hurst >= HURST_MR_MAX:
-            return {"action": "hold", "confidence": 0.0,
-                    "reason": f"rules: trending regime (H={hurst:.2f}≥{HURST_MR_MAX}) — skip mean-reversion",
-                    "source": "rules"}
-
-        if regime_gate != "mean_reversion":
-            return {"action": "hold", "confidence": 0.0,
-                    "reason": f"rules: regime {regime_gate} — prefer hold over forcing a KC fade",
-                    "source": "rules"}
-
         # ── Direction gate: MA trend filter ───────────────────────────────────
-        # In moderate trends (ADX ≤ ADX_MR_MAX), only trade WITH the trend.
-        # Longs require price > EMA50; shorts require price < EMA50.
+        # Only filter direction, never block the signal entirely.
         above_trend = price > ma_trend
         below_trend = price < ma_trend
         ma_filter   = indicators.get("ma_trend_filter", True)
 
-        slope_ok_long = trend_slope >= 0
+        slope_ok_long  = trend_slope >= 0
         slope_ok_short = trend_slope <= 0
         long_ok  = ((not ma_filter) or above_trend) and slope_ok_long
         short_ok = ((not ma_filter) or below_trend) and slope_ok_short
 
-        # ── Entry quality gate: require meaningful penetration beyond the KC band ──
-        # ATR-normalized penetration avoids treating a light touch like a true stretch.
-        long_quality_ok = (
-            price < kc_lower and
-            entry_quality_side in ("long", "neutral") and
-            entry_quality >= entry_quality_min
-        )
-        short_quality_ok = (
-            price > kc_upper and
-            entry_quality_side in ("short", "neutral") and
-            entry_quality >= entry_quality_min
-        )
+        # ── Check KC + RSI core signal ────────────────────────────────────────
+        long_signal  = price < kc_lower and rsi < rsi_os and long_ok
+        short_signal = price > kc_upper and rsi > rsi_ob and short_ok
 
-        # ── Signal ────────────────────────────────────────────────────────────
-        if price < kc_lower and rsi < rsi_os and long_ok and long_quality_ok:
-            trend_note = "above MA_TREND" if above_trend else "MA_TREND filter OFF"
-            return {"action": "long", "confidence": 0.75,
-                    "reason": (
-                        f"rules: below KC lower, RSI {rsi:.1f} < {rsi_os}, "
-                        f"{trend_note}, slope={trend_slope:+.4f}, entryQ={entry_quality:.2f} ATR"
-                    ),
-                    "source": "rules"}
-
-        if price > kc_upper and rsi > rsi_ob and short_ok and short_quality_ok:
-            trend_note = "below MA_TREND" if below_trend else "MA_TREND filter OFF"
-            return {"action": "short", "confidence": 0.75,
-                    "reason": (
-                        f"rules: above KC upper, RSI {rsi:.1f} > {rsi_ob}, "
-                        f"{trend_note}, slope={trend_slope:+.4f}, entryQ={entry_quality:.2f} ATR"
-                    ),
-                    "source": "rules"}
-
-        if (price < kc_lower and rsi < rsi_os and not long_quality_ok) or (
-            price > kc_upper and rsi > rsi_ob and not short_quality_ok
-        ):
+        if not long_signal and not short_signal:
             return {"action": "hold", "confidence": 0.0,
-                    "reason": (
-                        f"rules: KC penetration too shallow "
-                        f"(entryQ={entry_quality:.2f} ATR < {entry_quality_min:.2f}, atr={atr:.4f})"
-                    ),
+                    "reason": "rules: no signal — price inside channel or direction/slope filter",
                     "source": "rules"}
 
-        return {"action": "hold", "confidence": 0.0,
-                "reason": "rules: no signal — price inside channel or direction/slope filter active",
-                "source": "rules"}
+        action = "long" if long_signal else "short"
+
+        # ── Base confidence ───────────────────────────────────────────────────
+        confidence = 0.75
+
+        # ── Soft penalty 1: trending regime (ADX) ────────────────────────────
+        # Instead of hard-blocking, reduce confidence proportionally.
+        # ADX at 2× ADX_MR_MAX → full -0.20 penalty; linearly scaled below.
+        if adx > ADX_MR_MAX:
+            adx_excess = min(adx - ADX_MR_MAX, ADX_MR_MAX)   # cap at 1× ADX_MR_MAX range
+            adx_penalty = round(0.20 * adx_excess / ADX_MR_MAX, 3)
+            confidence = max(0.0, confidence - adx_penalty)
+
+        # ── Soft penalty 2: Hurst persistence ────────────────────────────────
+        if HURST_GATE and hurst >= HURST_MR_MAX:
+            hurst_excess = min(hurst - HURST_MR_MAX, 0.45)    # Hurst max is 1.0; excess beyond 0.55
+            hurst_penalty = round(0.15 * hurst_excess / 0.45, 3)
+            confidence = max(0.0, confidence - hurst_penalty)
+
+        # ── Soft penalty 3: regime_gate mismatch ─────────────────────────────
+        if regime_gate != "mean_reversion":
+            confidence = max(0.0, confidence - 0.10)
+
+        # ── Soft penalty 4: shallow KC penetration ───────────────────────────
+        # Below threshold → reduce confidence, do not veto.
+        quality_ok = (
+            entry_quality >= entry_quality_min and
+            entry_quality_side in (action, "neutral")
+        )
+        if not quality_ok:
+            confidence = max(0.0, confidence - 0.15)
+
+        trend_note = (
+            "above MA_TREND" if above_trend else
+            "below MA_TREND" if below_trend else
+            "MA_TREND filter OFF"
+        )
+        return {
+            "action": action,
+            "confidence": round(confidence, 3),
+            "reason": (
+                f"rules: {'below KC lower' if action == 'long' else 'above KC upper'}, "
+                f"RSI {rsi:.1f}{'<' if action=='long' else '>'}{rsi_os if action=='long' else rsi_ob}, "
+                f"{trend_note}, slope={trend_slope:+.4f}, entryQ={entry_quality:.2f}ATR"
+            ),
+            "source": "rules",
+        }
 
     except Exception as e:
         return {"action": "hold", "confidence": 0.0,

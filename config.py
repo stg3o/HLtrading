@@ -6,9 +6,29 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
+# ─── DIAGNOSTICS ──────────────────────────────────────────────────────────────
+DEBUG_MODE = False
+DEBUG_SCAN_LOGS = False
+LAST_STRATEGY_UPDATE = "2026-03-19 00:00:00"
+MIN_CONFIDENCE = 0.15
+HL_ORDER_SLIPPAGE = 0.002
+HL_ORDER_RETRY_SLIPPAGE = 0.004
+AUTO_IMPORT_POSITIONS = True
+DEFAULT_STOP_LOSS_PCT = 0.005
+DEFAULT_TAKE_PROFIT_PCT = 0.01
+TRADE_COOLDOWN_MINUTES = 15
+ENFORCE_LOSS_LIMIT_IN_PAPER = False
+MAX_HOLD_MINUTES = None
+LOW_VOLUME_EXTREME_RSI_LONG = 35
+LOW_VOLUME_EXTREME_RSI_SHORT = 65
+LOW_VOLUME_EXTREME_CONFIDENCE_PENALTY = 0.10
+LOW_VOLUME_EXTREME_SIZE_SCALAR = 0.50
+HL_MARKET_BUFFER = 0.002
+HL_MAX_FILL_SLIPPAGE = 0.005
+HL_ORACLE_DEVIATION_MAX = 0.01
+
 # ─── COINS ────────────────────────────────────────────────────────────────────
-# Per-coin timeframes: ETH/BTC use 1h (yfinance supports up to 730d),
-# SOL uses 5m scalping (yfinance caps 5m data at 60d).
+# Per-coin timeframes: ETH/BTC use 1h, SOL uses 5m scalping.
 #
 # strategy_type controls which entry/exit logic each coin uses:
 #   "mean_reversion" — KC band touch + RSI threshold + MA trend filter
@@ -28,7 +48,7 @@ COINS = {
     # Optimizer rank-1 + walk-forward ROBUST: st(10,2.5), sl=0.8%.
     # All top-5 converged on st_mult=2.5 and sl=0.8% — strong consensus.
     # Main exit is the ST flip (trend reversal); SL is safety-net only.
-    "ETH": {"ticker": "ETH-USD", "interval": "1h", "period": "365d",
+    "ETH": {"ticker": "ETH", "interval": "1h", "period": "365d",
             "hl_symbol": "ETH", "hl_size": 0.01,  "sz_decimals": 4,  "enabled": True,
             "strategy_type": "supertrend",
             "st_period": 10, "st_multiplier": 2.5,
@@ -40,12 +60,27 @@ COINS = {
     # Longer period than ETH (14 vs 10) = slower, cleaner BTC trend filter.
     # Walk-forward showed 34% pf decay in holdout — keep position sizing at
     # half of ETH until it proves itself live.
-    "BTC": {"ticker": "BTC-USD", "interval": "1h", "period": "365d",
-            "hl_symbol": "BTC", "hl_size": 0.001, "enabled": False,  # DISABLED: WR=17%, PF=0.90, drawdown=33.7% — losing strategy
+    "BTC": {"ticker": "BTC", "interval": "1h", "period": "365d",
+            "hl_symbol": "BTC", "hl_size": 0.001, "enabled": True,
             "strategy_type": "supertrend",
+            "allowed_regimes": ("trend", "high_volatility"),
+            "timeframes": {"higher": "4h", "mid": "1h", "entry": "1h"},
             "st_period": 14, "st_multiplier": 2.5,
             "stop_loss_pct": 0.008,
             "max_bars_in_trade": 168},
+
+    # BTC_RANGE — conservative 5m range strategy for allocator-based regime switching.
+    # Disabled by default to preserve current live behavior; enable alongside BTC
+    # once you want the allocator to trade BTC in both range and trend regimes.
+    "BTC_RANGE": {"ticker": "BTC", "interval": "5m", "period": "60d",
+                  "hl_symbol": "BTC", "hl_size": 0.001, "enabled": False,
+                  "strategy_type": "mean_reversion",
+                  "allowed_regimes": ("range",),
+                  "timeframes": {"higher": "4h", "mid": "1h", "entry": "5m"},
+                  "ma_trend_filter": True,
+                  "rsi_oversold": 35, "rsi_overbought": 65,
+                  "stop_loss_pct": 0.002, "take_profit_pct": 0.004,
+                  "max_bars_in_trade": 36},
 
     # SOL — KC mean-reversion scalping on 5m.
     # Problem: prior optimizer run produced only 13 trades over 60d — not
@@ -61,9 +96,11 @@ COINS = {
     # Optimizer (fixed-capital, Mar-2026): rank-1 = kc=1.0, rsi=40/60, PF=1.31, 1973 trades.
     # rsi updated 35/65 → 40/60: same PF (1.31 vs 1.30) but 635 more trades (1973 vs 1338).
     # sl=0.2% retained: wider SL kills Gate 3 (R:R check).
-    "SOL": {"ticker": "SOL-USD", "interval": "5m", "period": "60d",
+    "SOL": {"ticker": "SOL", "interval": "5m", "period": "60d",
             "hl_symbol": "SOL", "hl_size": 0.2,   "sz_decimals": 2,  "enabled": True,  # min floor; 0.2 SOL ≈ $16
             "strategy_type": "mean_reversion",
+            "allowed_regimes": ("range",),
+            "timeframes": {"higher": "4h", "mid": "1h", "entry": "5m"},
             "ma_trend_filter": True,   # re-enabled: prevents counter-trend fades in trending markets
             "rsi_oversold": 40, "rsi_overbought": 60,
             "stop_loss_pct": 0.002, "take_profit_pct": 0.004,
@@ -75,8 +112,9 @@ COINS = {
     # Key difference vs SOL: kc_scalar=2.0 (wider bands needed for DOGE's volatility),
     # rsi=45/55 (tighter RSI — more signals pass vs SOL's 35/65).
     # kc_scalar is now per-coin — does NOT affect SOL's kc=1.0.
-    # Note: yfinance only provides 5m data for DOGE up to 7 days, not 30 days.
-    "DOGE": {"ticker": "DOGE-USD", "interval": "5m", "period": "7d",
+    # ⚠ DISABLED: only 7 days of 5m history available — insufficient sample for
+    #   statistical validation. Re-enable once HL candle history confirms 30d+ of data.
+    "DOGE": {"ticker": "DOGE", "interval": "5m", "period": "7d",
              "hl_symbol": "DOGE", "hl_size": 500,  "enabled": True,
              "sz_decimals": 0,          # HL DOGE requires whole-number lot sizes (no fractions)
              "strategy_type": "mean_reversion",
@@ -87,7 +125,7 @@ COINS = {
              "max_bars_in_trade": 36},
 
     # ─── CANDIDATE COINS — disabled pending optimizer validation ──────────────────
-    # All confirmed to have 60d of 5m yfinance data (1280+ bars, Feb–Mar 2026).
+    # Candidate coins for the Hyperliquid-only trading universe.
     # Default params below are conservative starting points.  The optimizer will
     # search kc_scalar ∈ {1.0, 1.25, 1.5, 2.0} and rsi_oversold ∈ {35, 40, 45}.
     # Enable a coin ONLY after the optimizer shows PF ≥ 1.2 on its best config.
@@ -97,8 +135,9 @@ COINS = {
     # Optimizer rank-1 (60d): pf=1.23, wr=39%, 1326 trades — MARGINAL (barely clears 1.2 threshold).
     # ⚠ PROBATIONARY: live PF must stay ≥ 1.1 over first 30 trades; disable if it drifts below.
     # After spread/slippage, real-world edge is likely ~PF 1.05–1.10. Watch closely.
-    "XRP":  {"ticker": "XRP-USD",  "interval": "5m", "period": "60d",
-             "hl_symbol": "XRP",  "hl_size": 5,    "sz_decimals": 1,  "enabled": True,
+    "XRP":  {"ticker": "XRP",  "interval": "5m", "period": "60d",
+             "hl_symbol": "XRP",  "hl_size": 5,    "sz_decimals": 1,  "enabled": False,
+             "probationary": True,      # auto-disabled if live PF < 1.1 over 30 trades
              "strategy_type": "mean_reversion",
              "ma_trend_filter": True,   # re-enabled
              "rsi_oversold": 35, "rsi_overbought": 65,
@@ -108,8 +147,7 @@ COINS = {
     # WIF — meme-tier volatility. kc_scalar is irrelevant (all values tied at PF=1.45).
     # Optimizer fixed-capital rank-1 (Mar-2026): rsi=35/65, PF=1.45, 1557 trades.
     # rsi updated 40/60 → 35/65 (previous run had compounding artifact inflating 40/60).
-    # Note: yfinance only provides 5m data for WIF up to 30 days, not 60 days.
-    "WIF":  {"ticker": "WIF-USD",  "interval": "5m", "period": "30d",
+    "WIF":  {"ticker": "WIF",  "interval": "5m", "period": "30d",
              "hl_symbol": "WIF",  "hl_size": 7,    "sz_decimals": 0,  "enabled": True,
              "strategy_type": "mean_reversion",
              "kc_scalar": 1.5,
@@ -122,9 +160,8 @@ COINS = {
     # hl_size=500 → 500 k-lots = 500 000 BONK ≈ $11 at $0.000022/BONK.
     # Optimizer rank-1 (30d): pf=1.49, wr=36%, 1469 trades — strongest PF of new candidates.
     # ⚠ VERIFY HL denomination and sz_decimals against HL meta before switching to mainnet.
-    # Note: yfinance only provides 5m data for BONK up to 30 days, not 60 days.
-    "BONK": {"ticker": "BONK-USD", "interval": "5m", "period": "30d",
-             "hl_symbol": "BONK", "hl_size": 500,  "sz_decimals": 0,  "enabled": True,
+    "BONK": {"ticker": "kBONK", "interval": "5m", "period": "30d",
+             "hl_symbol": "kBONK", "hl_size": 500,  "sz_decimals": 0,  "enabled": True,
              "strategy_type": "mean_reversion",
              "kc_scalar": 2.0,
              "ma_trend_filter": True,   # re-enabled
@@ -134,7 +171,7 @@ COINS = {
 
     # ADA — large-cap alt; optimizer confirmed kc=1.0 (tighter bands suit lower volatility).
     # Optimizer rank-1 (60d): pf=1.45, wr=38%, 1378 trades.
-    "ADA":  {"ticker": "ADA-USD",  "interval": "5m", "period": "60d",
+    "ADA":  {"ticker": "ADA",  "interval": "5m", "period": "60d",
              "hl_symbol": "ADA",  "hl_size": 15,   "sz_decimals": 0,  "enabled": True,
              "strategy_type": "mean_reversion",
              "ma_trend_filter": True,   # re-enabled
@@ -144,7 +181,7 @@ COINS = {
 
     # AVAX — mid-cap L1; best Sharpe (13.14) and solid 41% WR among new candidates.
     # Optimizer rank-1 (60d): pf=1.47, wr=41%, 1390 trades. kc=1.0, rsi=35/65.
-    "AVAX": {"ticker": "AVAX-USD", "interval": "5m", "period": "60d",
+    "AVAX": {"ticker": "AVAX", "interval": "5m", "period": "60d",
              "hl_symbol": "AVAX", "hl_size": 0.4,  "sz_decimals": 2,  "enabled": True,
              "strategy_type": "mean_reversion",
              "ma_trend_filter": True,   # re-enabled
@@ -154,8 +191,8 @@ COINS = {
 
     # LINK — DeFi oracle token. Optimizer fixed-capital rank-1 (Mar-2026): kc=2.0, rsi=40/60.
     # kc updated 1.5 → 2.0: same PF=1.32 but 471 more trades (1865 vs 1394).
-    "LINK": {"ticker": "LINK-USD", "interval": "5m", "period": "60d",
-             "hl_symbol": "LINK", "hl_size": 0.8,  "sz_decimals": 2,  "enabled": True,
+    "LINK": {"ticker": "LINK", "interval": "5m", "period": "60d",
+             "hl_symbol": "LINK", "hl_size": 0.8,  "sz_decimals": 2,  "enabled": False,
              "strategy_type": "mean_reversion",
              "kc_scalar": 2.0,
              "ma_trend_filter": True,   # re-enabled
@@ -166,8 +203,9 @@ COINS = {
     # LTC — previously failed at PF=1.17 (compounding artifact). Fixed-capital rerun shows
     # PF=1.24 with kc=1.0, rsi=35/65 — now clears the 1.2 threshold. Enabled.
     # ⚠ PROBATIONARY: was previously sub-threshold. Live PF must stay ≥ 1.1 over first 30 trades.
-    "LTC":  {"ticker": "LTC-USD",  "interval": "5m", "period": "60d",
-             "hl_symbol": "LTC",  "hl_size": 0.12, "sz_decimals": 3,  "enabled": True,
+    "LTC":  {"ticker": "LTC",  "interval": "5m", "period": "60d",
+             "hl_symbol": "LTC",  "hl_size": 0.12, "sz_decimals": 3,  "enabled": False,
+             "probationary": True,      # auto-disabled if live PF < 1.1 over 30 trades
              "strategy_type": "mean_reversion",
              "ma_trend_filter": True,   # re-enabled
              "rsi_oversold": 35, "rsi_overbought": 65,
@@ -177,10 +215,11 @@ COINS = {
     # SHIB — ultra-low price meme coin; similar denomination caveat to BONK.
     # HL may denominate in k-lots; hl_size=1000 → 1M SHIB ≈ $13 at $0.000013.
     # Optimizer rank-1 (7d): pf=1.33, wr=40%, 1414 trades. kc=1.0, rsi=35/65.
-    # ⚠ VERIFY HL denomination and sz_decimals against HL meta before switching to mainnet.
-    # Note: yfinance only provides 5m data for SHIB up to 7 days, not 60 days.
-    "SHIB": {"ticker": "SHIB-USD", "interval": "5m", "period": "7d",
-             "hl_symbol": "SHIB", "hl_size": 1000, "sz_decimals": 0,  "enabled": True,
+    # ⚠ DISABLED: only 7 days of 5m history available — insufficient sample for
+    #   statistical validation. Also verify HL denomination before re-enabling.
+    #   Re-enable once HL candle history confirms 30d+ of data.
+    "SHIB": {"ticker": "kSHIB", "interval": "5m", "period": "7d",
+             "hl_symbol": "kSHIB", "hl_size": 1000, "sz_decimals": 0,  "enabled": False,
              "strategy_type": "mean_reversion",
              "ma_trend_filter": True,   # re-enabled
              "rsi_oversold": 35, "rsi_overbought": 65,
@@ -202,9 +241,11 @@ COINS = {
     # SOL_ST — optimizer walk-forward (Mar-2026): ST(14,2.0), sl=0.8%
     # Train PF=2.52, holdout PF=1.46 (87 trades) — edge confirmed on OOS data.
     # "OVERFIT" flag fired (42% PF decay train→val) but holdout PF > 1.0 is what counts.
-    "SOL_ST": {"ticker": "SOL-USD", "interval": "1h", "period": "365d",
+    "SOL_ST": {"ticker": "SOL", "interval": "1h", "period": "365d",
                "hl_symbol": "SOL",  "hl_size": 0.2,  "sz_decimals": 2,  "enabled": True,
                "strategy_type": "supertrend",
+               "allowed_regimes": ("trend", "high_volatility"),
+               "timeframes": {"higher": "4h", "mid": "1h", "entry": "1h"},
                "st_period": 14, "st_multiplier": 2.0,
                "stop_loss_pct": 0.008,
                "take_profit_pct": 0.05,
@@ -213,9 +254,11 @@ COINS = {
     # AVAX_ST — optimizer walk-forward (Mar-2026): ST(7,2.5), sl=0.8%
     # Train PF=2.55, holdout PF=1.73 (93 trades) — strongest OOS result of the three.
     # Faster ST period (7) suits AVAX's shorter trend cycles vs SOL.
-    "AVAX_ST": {"ticker": "AVAX-USD", "interval": "1h", "period": "365d",
+    "AVAX_ST": {"ticker": "AVAX", "interval": "1h", "period": "365d",
                 "hl_symbol": "AVAX", "hl_size": 0.4,  "sz_decimals": 2,  "enabled": True,
                 "strategy_type": "supertrend",
+                "allowed_regimes": ("trend", "high_volatility"),
+                "timeframes": {"higher": "4h", "mid": "1h", "entry": "1h"},
                 "st_period": 7, "st_multiplier": 2.5,
                 "stop_loss_pct": 0.008,
                 "take_profit_pct": 0.05,
@@ -224,9 +267,11 @@ COINS = {
     # LINK_ST — DISABLED: holdout PF=0.82 (-0.63 Sharpe, 59 trades) — losing on OOS.
     # LINK trends too poorly on 1h for SuperTrend to extract edge.
     # The 5m KC mean-reversion config (LINK) remains active for ranging regimes.
-    "LINK_ST": {"ticker": "LINK-USD", "interval": "1h", "period": "365d",
+    "LINK_ST": {"ticker": "LINK", "interval": "1h", "period": "365d",
                 "hl_symbol": "LINK", "hl_size": 0.8,  "sz_decimals": 2,  "enabled": False,
                 "strategy_type": "supertrend",
+                "allowed_regimes": ("trend", "high_volatility"),
+                "timeframes": {"higher": "4h", "mid": "1h", "entry": "1h"},
                 "st_period": 7, "st_multiplier": 3.5,
                 "stop_loss_pct": 0.008,
                 "take_profit_pct": 0.05,
@@ -281,6 +326,57 @@ HURST_MR_MAX = 0.55   # skip mean-reversion when Hurst ≥ 0.55 (trending / rand
 AI_ENABLED               = False   # True = call LLM; False = use rule-based signal directly
 ENTRY_QUALITY_GATE       = False   # True = enforce z-score ≥ MIN_ENTRY_QUALITY
 HURST_GATE               = True    # True = skip mean-reversion when Hurst ≥ HURST_MR_MAX
+
+# ─── MULTI-TIMEFRAME / REGIME ALLOCATION ─────────────────────────────────────
+MTF_TIMEFRAME_DEFAULTS = {
+    "higher": {"interval": "4h", "period": "180d"},
+    "mid": {"interval": "1h", "period": "90d"},
+    "entry": {"interval": None, "period": None},
+}
+STRATEGY_ALLOWED_REGIMES = {
+    "mean_reversion": ("range",),
+    "supertrend": ("trend", "high_volatility"),
+}
+REGIME_TREND_ADX_MIN = 25.0
+REGIME_RANGE_ADX_MAX = 25.0   # raised from 22 — closes the 22-25 dead zone where
+                               # neither mean-reversion nor trend signals could fire.
+REGIME_HIGH_VOL_ATR_PCT = 0.025
+REGIME_VOL_EXPANSION_BANDWIDTH = 0.06
+EXTREME_VOL_ATR_PCT = 0.04
+ALLOCATE_BEST_STRATEGY_PER_SYMBOL = True
+
+# ─── FUNDING / OPEN INTEREST ──────────────────────────────────────────────────
+USE_FUNDING_RATE_SIGNAL = True
+USE_OPEN_INTEREST_SIGNAL = True
+FUNDING_EXTREME_ABS = 0.0005        # 0.05% current funding regarded as crowded
+FUNDING_CONFLICT_PENALTY = 0.15     # hold if extreme funding fights the trade
+FUNDING_CONTRARIAN_BONUS = 0.05     # modest confidence lift when fading crowded side
+FUNDING_HARD_BLOCK_ABS = 0.0010     # 0.10% funding = fully suppress crowded direction
+OI_MIN_PCT_CHANGE = 0.01            # 1% scan-to-scan OI move required for confirmation
+REQUIRE_OI_CONFIRMATION_FOR_TREND = True
+SUPPRESS_TREND_ON_OI_DIVERGENCE = True
+
+# ─── BTC MARKET FILTER ────────────────────────────────────────────────────────
+USE_BTC_MARKET_FILTER = True
+BTC_FILTER_INTERVAL = "1h"
+BTC_FILTER_PERIOD = "90d"
+BTC_FILTER_TREND_ADX = 32.0
+BTC_FILTER_EXTREME_VOL_ATR_PCT = 0.03
+BTC_FILTER_SUPPRESS_ALTCOINS = True
+BTC_ALT_SIGNAL_CONFIDENCE_PENALTY = 0.20
+
+# ─── LIQUIDATION CASCADE FILTER ───────────────────────────────────────────────
+USE_CASCADE_FILTER = True
+CASCADE_VOLUME_SPIKE_MIN = 2.5          # completed bar volume / 20-bar avg
+CASCADE_RANGE_ATR_MIN = 1.8             # completed bar range / ATR
+CASCADE_BREAKOUT_LOOKBACK = 20          # bars for recent high/low breakout
+CASCADE_BREAKOUT_ATR_BUFFER = 0.15      # require breakout by >= 0.15 ATR
+CASCADE_EXTREME_VOLUME_SPIKE = 4.0
+CASCADE_EXTREME_RANGE_ATR = 2.8
+CASCADE_TREND_CONFIDENCE_BONUS = 0.08   # boost aligned supertrend entry
+CASCADE_MR_ENTRY_QUALITY_BONUS = 0.20   # only upgrades existing MR quality
+CASCADE_RISK_CONFIDENCE_PENALTY = 0.20  # reduce confidence during unstable extremes
+CASCADE_RISK_BLOCK_EXTREME = True       # fully suppress unstable extreme cascades
 
 # ─── RISK MANAGEMENT ──────────────────────────────────────────────────────────
 PAPER_CAPITAL      = 672.0    # starting paper capital (USD) — matches testnet wallet
@@ -380,3 +476,5 @@ STATE_FILE        = BASE_DIR / "paper_state.json"
 TRADES_FILE       = BASE_DIR / "paper_trades.csv"
 SIGNALS_LOG       = BASE_DIR / "signals.log"
 BEST_CONFIGS_FILE = BASE_DIR / "best_configs.json"
+# Runtime-disabled coins written here so the circuit breaker survives restarts.
+DISABLED_COINS_FILE = BASE_DIR / "disabled_coins.json"
